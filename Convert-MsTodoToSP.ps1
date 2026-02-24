@@ -1,249 +1,846 @@
-# PowerShell script to convert Microsoft To Do JSON export to Super Productivity format
-# Usage: .\Convert-MsTodoToSP.ps1 -InputFile "temp\ms-todo.json" -OutputFile "temp\sp_converted.json"
+# PowerShell script to convert Microsoft To Do JSON export to Super Productivity BACKUP format
+#
+# Supported input formats:
+#   1. lists.json  – flat array of list objects, each with an embedded "tasks" array
+#   2. ms-todo.json – object with { "lists": [...], "tasks": { "<listId>": [...] } }
+#
+# Output: CompleteBackup JSON ready to import into Super Productivity
+#   (Settings → Sync & Backup → Import from File)
+#
+# Usage:
+#   .\Convert-MsTodoToSP.ps1 -InputFile "temp\lists.json" -OutputFile "temp\sp_import.json"
 
 param(
     [string]$InputFile = "temp\ms-todo.json",
     [string]$OutputFile = "temp\sp_converted.json"
 )
 
-# Function to generate a short unique ID similar to SP format
+Set-StrictMode -Off
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+# Generate a 21-character base64url ID (similar to SP's nanoid IDs)
 function New-SPId {
-    # Generate a 21-character ID using base64url encoding of a GUID
-    $guid = [guid]::NewGuid()
-    $bytes = $guid.ToByteArray()
-    $base64 = [Convert]::ToBase64String($bytes)
-    # Make it URL-safe and take first 21 chars
-    $base64 = $base64.Replace('+', '-').Replace('/', '_').Replace('=', '')
-    return $base64.Substring(0, 21)
+    $bytes = [guid]::NewGuid().ToByteArray()
+    $b64 = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=')
+    return $b64.Substring(0, [Math]::Min(21, $b64.Length))
 }
 
-# Function to get DB date string (YYYY-MM-DD)
+# Return ISO date string YYYY-MM-DD from a DateTimeOffset
 function Get-DbDateStr {
     param([DateTimeOffset]$date)
     return $date.ToString("yyyy-MM-dd")
 }
 
-function Add-IfNotNull {
-    param($hashtable, $key, $value)
-    if ($null -ne $value) {
-        $hashtable[$key] = $value
-    }
+# Return ISO date string YYYY-MM-DD for a specific day-of-month in a given year/month
+function Get-DbDateStrFromDayOfMonth {
+    param([DateTimeOffset]$baseDate, [int]$dayOfMonth)
+    $maxDay = [DateTime]::DaysInMonth($baseDate.Year, $baseDate.Month)
+    $d = [Math]::Min($dayOfMonth, $maxDay)
+    return "$($baseDate.Year)-$($baseDate.Month.ToString('00'))-$($d.ToString('00'))"
 }
 
-$msTodo = Get-Content -Path $InputFile -Encoding UTF8 | ConvertFrom-Json
+# Try to parse a datetime string; return $null on failure / empty input
+function Parse-Dto {
+    param([string]$s)
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    try { return [DateTimeOffset]::Parse($s, [System.Globalization.CultureInfo]::InvariantCulture) }
+    catch { return $null }
+}
 
-# Collect imported project and tag ids
-$importedProjectIds = @()
+# ---------------------------------------------------------------------------
+# Static defaults matching SP's DEFAULT_PROJECT / DEFAULT_TAG constants
+# ---------------------------------------------------------------------------
 
-# Collect unique tags
-$tagNames = @{}
-$tagNames["Important"] = $true  # For high importance tasks
+$NowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 
-# Process lists and tasks to collect categories
-foreach ($list in $msTodo.lists) {
-    if ($msTodo.tasks.PSObject.Properties[$list.id]) {
-        foreach ($msTask in $msTodo.tasks.($list.id)) {
-            if ($msTask.categories) {
-                foreach ($cat in $msTask.categories) {
-                    $tagNames[$cat] = $true
+$DefaultWorklogExport = [ordered]@{
+    cols             = @("DATE", "START", "END", "TIME_CLOCK", "TITLES_INCLUDING_SUB")
+    roundWorkTimeTo  = $null
+    roundStartTimeTo = $null
+    roundEndTimeTo   = $null
+    separateTasksBy  = " | "
+    groupBy          = "DATE"
+}
+$DefaultAdvancedCfg = [ordered]@{ worklogExportSettings = $DefaultWorklogExport }
+
+$DefaultTagTheme = @{
+    isAutoContrast           = $true
+    isDisableBackgroundTint  = $false
+    primary                  = "#a05db1"    # DEFAULT_TAG_COLOR
+    huePrimary               = "500"
+    accent                   = "#ff4081"
+    hueAccent                = "500"
+    warn                     = "#e11826"
+    hueWarn                  = "500"
+    backgroundImageDark      = $null
+    backgroundImageLight     = $null
+    backgroundOverlayOpacity = 20
+}
+
+$DefaultProjectTheme = @{
+    isAutoContrast           = $true
+    isDisableBackgroundTint  = $false
+    primary                  = "#29a1aa"    # DEFAULT_PROJECT_COLOR
+    huePrimary               = "500"
+    accent                   = "#ff4081"
+    hueAccent                = "500"
+    warn                     = "#e11826"
+    hueWarn                  = "500"
+    backgroundImageDark      = $null
+    backgroundImageLight     = $null
+    backgroundOverlayOpacity = 20
+}
+
+$TodayTagTheme = @{
+    isAutoContrast           = $true
+    isDisableBackgroundTint  = $true
+    primary                  = "#6495ED"    # DEFAULT_TODAY_TAG_COLOR
+    huePrimary               = "400"
+    accent                   = "#ff4081"
+    hueAccent                = "500"
+    warn                     = "#e11826"
+    hueWarn                  = "500"
+    backgroundImageDark      = ""
+    backgroundImageLight     = $null
+    backgroundOverlayOpacity = 20
+}
+
+# ---------------------------------------------------------------------------
+# Parse input file (supports both formats)
+# ---------------------------------------------------------------------------
+
+$rawData = Get-Content -Path $InputFile -Encoding UTF8 | ConvertFrom-Json
+
+$lists = @()
+if ($rawData -is [array]) {
+    # Format 1: flat array of lists with embedded tasks
+    $lists = $rawData
+}
+elseif ($null -ne $rawData.lists) {
+    # Format 2: { lists: [...], tasks: { listId: [...] } }
+    foreach ($l in $rawData.lists) {
+        $copy = $l | Select-Object *
+        if ($null -ne $rawData.tasks -and
+            $rawData.tasks.PSObject.Properties.Name -contains $l.id) {
+            $copy | Add-Member -NotePropertyName 'tasks' `
+                -NotePropertyValue $rawData.tasks.($l.id) `
+                -Force
+        }
+        $lists += $copy
+    }
+}
+else {
+    Write-Error "Unrecognised input format. Expected array of lists or { lists, tasks } object."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Pass 1 – collect all unique tag names from categories + importance
+# ---------------------------------------------------------------------------
+
+$tagNameSet = [System.Collections.Generic.SortedSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($list in $lists) {
+    if (-not $list.tasks) { continue }
+    foreach ($t in $list.tasks) {
+        # Add "Important" tag only if at least one task actually needs it
+        if ($t.importance -eq "high") {
+            $tagNameSet.Add("Important") | Out-Null
+        }
+        if ($t.categories) {
+            foreach ($c in $t.categories) {
+                if (-not [string]::IsNullOrWhiteSpace($c)) {
+                    $tagNameSet.Add($c.Trim()) | Out-Null
                 }
             }
         }
-    }
-}
-
-# Create tag entities
-$tagEntities = @{}
-foreach ($tagName in $tagNames.Keys) {
-    $tagId = New-SPId
-    $tagEntities[$tagId] = @{
-        id          = $tagId
-        title       = $tagName
-        color       = "#42a5f5"  # Default color # TODO: Hardcoded Default Values
-        created     = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
-        modified    = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
-        icon        = $null
-        taskIds     = @()
-        advancedCfg = @{
-            worklogExportSettings = @{
-                cols             = @("DATE", "START", "END", "TIME_CLOCK", "TITLES_INCLUDING_SUB")
-                roundWorkTimeTo  = $null
-                roundStartTimeTo = $null
-                roundEndTimeTo   = $null
-                separateTasksBy  = " | "
-                groupBy          = "DATE"
+        # Extract inline #tags from the task title (e.g. "Buy milk #shopping #urgent")
+        if ($t.title -and $t.title -match '#') {
+            foreach ($m in [regex]::Matches($t.title, '#(\w+)')) {
+                $tagNameSet.Add($m.Groups[1].Value) | Out-Null
             }
         }
-        theme       = @{
-            isAutoContrast           = $true
-            isDisableBackgroundTint  = $false
-            primary                  = "#42a5f5"
-            huePrimary               = "500"
-            accent                   = "#ff4081"
-            hueAccent                = "500"
-            warn                     = "#e11826"
-            hueWarn                  = "500"
-            backgroundImageDark      = $null
-            backgroundImageLight     = $null
-            backgroundOverlayOpacity = 0
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Build tag entities (imported tags + mandatory TODAY_TAG)
+# ---------------------------------------------------------------------------
+
+$tagNameToId = @{}         # tagName -> tagId
+$tagEntities = [ordered]@{}
+
+# Imported tags first (they get added to the folder in menuTree)
+foreach ($name in $tagNameSet) {
+    $id = New-SPId
+    $tagNameToId[$name] = $id
+    $tagEntities[$id] = [ordered]@{
+        id          = $id
+        title       = $name
+        color       = $null
+        created     = $NowMs
+        modified    = $NowMs
+        icon        = $null
+        taskIds     = [System.Collections.Generic.List[string]]::new()
+        advancedCfg = $DefaultAdvancedCfg
+        theme       = $DefaultTagTheme.Clone()
+    }
+}
+
+# TODAY_TAG – a mandatory virtual tag; id must equal 'TODAY'
+$TODAY_ID = 'TODAY'
+$tagEntities[$TODAY_ID] = [ordered]@{
+    id          = $TODAY_ID
+    title       = 'Today'
+    color       = $null
+    created     = $NowMs
+    modified    = $NowMs
+    icon        = 'wb_sunny'
+    taskIds     = [System.Collections.Generic.List[string]]::new()
+    advancedCfg = $DefaultAdvancedCfg
+    theme       = $TodayTagTheme.Clone()
+}
+
+# ---------------------------------------------------------------------------
+# Processing state
+# ---------------------------------------------------------------------------
+
+$taskEntities = [ordered]@{}
+$projectEntities = [ordered]@{}
+$projectIds = [System.Collections.Generic.List[string]]::new()
+$repeatCfgEntities = [ordered]@{}
+$repeatCfgIds = [System.Collections.Generic.List[string]]::new()
+$remindersList = [System.Collections.Generic.List[object]]::new()
+$importedProjectIds = [System.Collections.Generic.List[string]]::new()
+$repeatCfgOrder = 0
+
+# ---------------------------------------------------------------------------
+# Internal helper: map MS Graph recurrence pattern → SP repeat fields
+# Returns a hashtable with SP repeat fields, or $null if pattern is unrecognised.
+#
+# MS Graph pattern types:
+#   daily            – every N days
+#   weekly           – every N weeks on daysOfWeek
+#   absoluteMonthly  – every N months on dayOfMonth
+#   relativeMonthly  – every N months on Nth weekday (e.g. "second Tuesday")
+#                      → mapped to MONTHLY (best approximation, weekday constraint lost)
+#   absoluteYearly   – every N years on month/dayOfMonth
+#   relativeYearly   – every N years on Nth weekday of month
+#                      → mapped to YEARLY (best approximation)
+#   hourly           – every N hours → mapped to DAILY (closest SP option)
+# ---------------------------------------------------------------------------
+function Convert-RecurrencePattern {
+    param(
+        [object]$pattern,
+        [DateTimeOffset]$createdDate,
+        [string]$dueDateStr   # ISO datetime from dueDateTime (may be $null/empty)
+    )
+
+    if (-not $pattern) { return $null }
+
+    $patType = if ($pattern.PSObject.Properties.Name -contains 'type') { $pattern.type } else { '' }
+    $interval = if ($pattern.PSObject.Properties.Name -contains 'interval') { [int]($pattern.interval) } else { 1 }
+    if ($interval -lt 1) { $interval = 1 }
+
+    # Weekday flags stored in a hashtable to avoid nested-scope issues
+    $days = @{ mon = $false; tue = $false; wed = $false; thu = $false; fri = $false; sat = $false; sun = $false }
+
+    # Script block: set flags for each MS Graph day name (Title-case or lowercase)
+    $setDays = {
+        param([object[]]$dayNames)
+        foreach ($d in $dayNames) {
+            switch ($d.ToString().ToLower()) {
+                "monday" { $days.mon = $true }
+                "tuesday" { $days.tue = $true }
+                "wednesday" { $days.wed = $true }
+                "thursday" { $days.thu = $true }
+                "friday" { $days.fri = $true }
+                "saturday" { $days.sat = $true }
+                "sunday" { $days.sun = $true }
+            }
+        }
+    }
+
+    # Script block: set the flag for whatever weekday $createdDate falls on
+    $setCreatedDay = {
+        switch ($createdDate.DayOfWeek) {
+            ([DayOfWeek]::Monday) { $days.mon = $true }
+            ([DayOfWeek]::Tuesday) { $days.tue = $true }
+            ([DayOfWeek]::Wednesday) { $days.wed = $true }
+            ([DayOfWeek]::Thursday) { $days.thu = $true }
+            ([DayOfWeek]::Friday) { $days.fri = $true }
+            ([DayOfWeek]::Saturday) { $days.sat = $true }
+            ([DayOfWeek]::Sunday) { $days.sun = $true }
+        }
+    }
+
+    $repeatCycle = $null
+    $startDate = $null
+
+    switch ($patType.ToLower()) {
+
+        "daily" {
+            $repeatCycle = "DAILY"
+        }
+
+        "hourly" {
+            # SP has no hourly option; DAILY is the closest approximation
+            $repeatCycle = "DAILY"
+            $interval = 1
+            Write-Warning "  [recurrence] 'hourly' pattern mapped to DAILY (SP has no hourly repeat)."
+        }
+
+        "weekly" {
+            $repeatCycle = "WEEKLY"
+            $hasDays = ($pattern.PSObject.Properties.Name -contains 'daysOfWeek') -and
+            $pattern.daysOfWeek -and
+            $pattern.daysOfWeek.Count -gt 0
+            if ($hasDays) { & $setDays $pattern.daysOfWeek }
+            else { & $setCreatedDay }
+        }
+
+        { $_ -eq "absolutemonthly" -or $_ -eq "relativemonthly" } {
+            $repeatCycle = "MONTHLY"
+
+            # Prefer dueDate's day; fall back to dayOfMonth field; then createdDate
+            if (-not [string]::IsNullOrWhiteSpace($dueDateStr)) {
+                $dto = Parse-Dto $dueDateStr
+                if ($dto) { $startDate = Get-DbDateStr $dto }
+            }
+            if (-not $startDate -and
+                $pattern.PSObject.Properties.Name -contains 'dayOfMonth' -and
+                $pattern.dayOfMonth -gt 0) {
+                $startDate = Get-DbDateStrFromDayOfMonth $createdDate ([int]$pattern.dayOfMonth)
+            }
+            if (-not $startDate) { $startDate = Get-DbDateStr $createdDate }
+
+            if ($patType.ToLower() -eq "relativemonthly") {
+                Write-Warning "  [recurrence] 'relativeMonthly' (Nth weekday of month) mapped to MONTHLY – weekday constraint lost."
+            }
+        }
+
+        { $_ -eq "absoluteyearly" -or $_ -eq "relativeyearly" } {
+            $repeatCycle = "YEARLY"
+
+            if (-not [string]::IsNullOrWhiteSpace($dueDateStr)) {
+                $dto = Parse-Dto $dueDateStr
+                if ($dto) { $startDate = Get-DbDateStr $dto }
+            }
+            if (-not $startDate) { $startDate = Get-DbDateStr $createdDate }
+
+            if ($patType.ToLower() -eq "relativeyearly") {
+                Write-Warning "  [recurrence] 'relativeYearly' (Nth weekday of month/year) mapped to YEARLY – weekday constraint lost."
+            }
+        }
+
+        default {
+            Write-Warning "  [recurrence] Unknown pattern type '$patType' – skipping repeat config."
+            return $null
+        }
+    }
+
+    # Determine quickSetting
+    $quickSetting = "CUSTOM"
+    $activeDays = @($days.mon, $days.tue, $days.wed, $days.thu, $days.fri, $days.sat, $days.sun) | Where-Object { $_ }
+    $weekdayCount = @($days.mon, $days.tue, $days.wed, $days.thu, $days.fri) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
+    if ($repeatCycle -eq "DAILY" -and $interval -eq 1) {
+        $quickSetting = "DAILY"
+    }
+    elseif ($repeatCycle -eq "WEEKLY" -and $interval -eq 1) {
+        if ($activeDays.Count -eq 1) {
+            $quickSetting = "WEEKLY_CURRENT_WEEKDAY"
+        }
+        elseif ($weekdayCount -eq 5 -and -not $days.sat -and -not $days.sun) {
+            $quickSetting = "MONDAY_TO_FRIDAY"
+        }
+    }
+    elseif ($repeatCycle -eq "MONTHLY" -and $interval -eq 1) {
+        $quickSetting = "MONTHLY_CURRENT_DATE"
+    }
+    elseif ($repeatCycle -eq "YEARLY" -and $interval -eq 1) {
+        $quickSetting = "YEARLY_CURRENT_DATE"
+    }
+
+    return [ordered]@{
+        repeatCycle  = $repeatCycle
+        repeatEvery  = $interval
+        quickSetting = $quickSetting
+        monday       = $days.mon
+        tuesday      = $days.tue
+        wednesday    = $days.wed
+        thursday     = $days.thu
+        friday       = $days.fri
+        saturday     = $days.sat
+        sunday       = $days.sun
+        startDate    = $startDate   # $null for DAILY/WEEKLY; string for MONTHLY/YEARLY
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Pass 2 – convert lists → projects and tasks → SP tasks
+# ---------------------------------------------------------------------------
+
+foreach ($list in $lists) {
+    $projectId = New-SPId
+
+    $project = [ordered]@{
+        id               = $projectId
+        title            = $list.displayName
+        taskIds          = [System.Collections.Generic.List[string]]::new()
+        icon             = "list_alt"
+        isHiddenFromMenu = $false
+        isArchived       = $false
+        isEnableBacklog  = $false
+        backlogTaskIds   = @()
+        noteIds          = @()
+        advancedCfg      = $DefaultAdvancedCfg
+        theme            = $DefaultProjectTheme.Clone()
+    }
+
+    $projectEntities[$projectId] = $project
+    $projectIds.Add($projectId)
+    $importedProjectIds.Add($projectId)
+
+    if (-not $list.tasks) { continue }
+
+    foreach ($msTask in $list.tasks) {
+        if ([string]::IsNullOrWhiteSpace($msTask.title)) { continue }
+
+        $taskId = New-SPId
+
+        # ---- extract inline #tags from title for linking (title is kept as-is) ----
+        $inlineTagMatches = [regex]::Matches($msTask.title, '#(\w+)')
+
+        # --- timestamps ---
+        $created = $NowMs
+        $modified = $NowMs
+        $dto = Parse-Dto $msTask.createdDateTime
+        if ($dto) { $created = $dto.ToUnixTimeMilliseconds() }
+        $dto = Parse-Dto $msTask.lastModifiedDateTime
+        if ($dto) { $modified = $dto.ToUnixTimeMilliseconds() }
+
+        $isDone = ($msTask.status -eq "completed")
+        $doneOn = $null
+        if ($isDone -and
+            $msTask.PSObject.Properties.Name -contains 'completedDateTime' -and
+            $msTask.completedDateTime -and
+            $msTask.completedDateTime.PSObject.Properties.Name -contains 'dateTime') {
+            $dto = Parse-Dto $msTask.completedDateTime.dateTime
+            if ($dto) { $doneOn = $dto.ToUnixTimeMilliseconds() }
+        }
+        # Fallback: if task is done but no completedDateTime, use lastModified
+        if ($isDone -and $null -eq $doneOn) { $doneOn = $modified }
+
+        # --- tag IDs ---
+        $taskTagIds = [System.Collections.Generic.List[string]]::new()
+
+        if ($msTask.importance -eq "high") {
+            $tid = $tagNameToId["Important"]
+            if ($tid) {
+                $taskTagIds.Add($tid)
+                if (-not $tagEntities[$tid].taskIds.Contains($taskId)) {
+                    $tagEntities[$tid].taskIds.Add($taskId)
+                }
+            }
+        }
+
+        if ($msTask.categories) {
+            foreach ($cat in $msTask.categories) {
+                if ([string]::IsNullOrWhiteSpace($cat)) { continue }
+                $tid = $tagNameToId[$cat.Trim()]
+                if ($tid -and -not $taskTagIds.Contains($tid)) {
+                    $taskTagIds.Add($tid)
+                    if (-not $tagEntities[$tid].taskIds.Contains($taskId)) {
+                        $tagEntities[$tid].taskIds.Add($taskId)
+                    }
+                }
+            }
+        }
+
+        # ---- inline #tags extracted from title --------------------------------
+        foreach ($m in $inlineTagMatches) {
+            $tid = $tagNameToId[$m.Groups[1].Value]
+            if ($tid -and -not $taskTagIds.Contains($tid)) {
+                $taskTagIds.Add($tid)
+                if (-not $tagEntities[$tid].taskIds.Contains($taskId)) {
+                    $tagEntities[$tid].taskIds.Add($taskId)
+                }
+            }
+        }
+
+        # ---- due date ---------------------------------------------------------
+        # dueWithTime and dueDay are mutually exclusive; check dueWithTime first.
+        $dueWithTime = $null
+        $dueDay = $null
+        $dueDateIsoStr = $null   # raw ISO string kept for recurrence startDate derivation
+
+        if ($msTask.PSObject.Properties.Name -contains 'dueDateTime' -and
+            $msTask.dueDateTime -and
+            $msTask.dueDateTime.PSObject.Properties.Name -contains 'dateTime') {
+            $dto = Parse-Dto $msTask.dueDateTime.dateTime
+            if ($dto) {
+                $dueDateIsoStr = $msTask.dueDateTime.dateTime
+                # If time-of-day component is less than 1 minute → treat as date-only
+                if ($dto.TimeOfDay.TotalSeconds -lt 60) {
+                    $dueDay = Get-DbDateStr $dto
+                }
+                else {
+                    $dueWithTime = $dto.ToUnixTimeMilliseconds()
+                }
+            }
+        }
+        $hasPlannedTime = ($null -ne $dueDay -or $null -ne $dueWithTime)
+
+        # --- reminder (reminderDateTime) ---
+        $reminderId = $null
+        $remindAt = $null
+        if ($msTask.isReminderOn -eq $true -and
+            $msTask.PSObject.Properties.Name -contains 'reminderDateTime' -and
+            $msTask.reminderDateTime -and
+            $msTask.reminderDateTime.PSObject.Properties.Name -contains 'dateTime') {
+            $dto = Parse-Dto $msTask.reminderDateTime.dateTime
+            if ($dto) {
+                $remindAt = $dto.ToUnixTimeMilliseconds()
+                $reminderId = New-SPId
+                $remindersList.Add([ordered]@{
+                        id        = $reminderId
+                        remindAt  = $remindAt
+                        title     = $msTask.title
+                        type      = "TASK"
+                        relatedId = $taskId
+                    })
+            }
+        }
+
+        # --- build task entity ---
+        $task = [ordered]@{
+            id             = $taskId
+            title          = $msTask.title
+            projectId      = $projectId
+            isDone         = $isDone
+            created        = $created
+            modified       = $modified
+            subTaskIds     = [System.Collections.Generic.List[string]]::new()
+            tagIds         = @($taskTagIds)
+            timeSpentOnDay = [ordered]@{}
+            timeEstimate   = 0
+            timeSpent      = 0
+            hasPlannedTime = $hasPlannedTime
+            attachments    = @()
+        }
+
+        if ($null -ne $doneOn) { $task["doneOn"] = $doneOn }
+        if ($null -ne $dueWithTime) { $task["dueWithTime"] = $dueWithTime }
+        if ($null -ne $dueDay) { $task["dueDay"] = $dueDay }
+        if ($null -ne $reminderId) {
+            $task["reminderId"] = $reminderId
+            $task["remindAt"] = $remindAt
+        }
+
+        # --- notes (body) ---
+        if ($msTask.PSObject.Properties.Name -contains 'body' -and
+            $msTask.body -and
+            $msTask.body.PSObject.Properties.Name -contains 'content' -and
+            -not [string]::IsNullOrWhiteSpace($msTask.body.content)) {
+            $task["notes"] = $msTask.body.content.Trim()
+        }
+
+        # ---- recurrence -------------------------------------------------------
+        # Completed tasks are not migrated with a repeat config – they are
+        # historical instances and the repeat should start fresh in SP.
+        if (-not $isDone -and
+            $msTask.PSObject.Properties.Name -contains 'recurrence' -and
+            $msTask.recurrence -and
+            $msTask.recurrence.PSObject.Properties.Name -contains 'pattern' -and
+            $msTask.recurrence.pattern) {
+
+            $taskCreatedDate = [DateTimeOffset]::FromUnixTimeMilliseconds($created)
+            $startDateStr = Get-DbDateStr $taskCreatedDate
+
+            $rp = Convert-RecurrencePattern `
+                -pattern     $msTask.recurrence.pattern `
+                -createdDate $taskCreatedDate `
+                -dueDateStr  $dueDateIsoStr
+
+            if ($rp) {
+                $repeatCfgId = New-SPId
+                $repeatNotes = if ($task.Contains("notes")) { $task["notes"] } else { $null }
+
+                # Snapshot tagIds array now (taskTagIds is still a List at this point)
+                $repeatTagIds = @($taskTagIds)
+
+                $repeatCfg = [ordered]@{
+                    id                       = $repeatCfgId
+                    projectId                = $projectId
+                    lastTaskCreation         = $created
+                    lastTaskCreationDay      = $startDateStr
+                    title                    = $msTask.title
+                    tagIds                   = $repeatTagIds
+                    order                    = $repeatCfgOrder++
+                    isPaused                 = $false
+                    quickSetting             = $rp.quickSetting
+                    repeatCycle              = $rp.repeatCycle
+                    repeatEvery              = $rp.repeatEvery
+                    monday                   = $rp.monday
+                    tuesday                  = $rp.tuesday
+                    wednesday                = $rp.wednesday
+                    thursday                 = $rp.thursday
+                    friday                   = $rp.friday
+                    saturday                 = $rp.saturday
+                    sunday                   = $rp.sunday
+                    notes                    = $repeatNotes
+                    shouldInheritSubtasks    = $false
+                    repeatFromCompletionDate = $false
+                    deletedInstanceDates     = @()
+                }
+
+                # startDate is only meaningful for MONTHLY / YEARLY
+                if ($rp.repeatCycle -eq "MONTHLY" -or $rp.repeatCycle -eq "YEARLY") {
+                    $repeatCfg["startDate"] = if ($rp.startDate) { $rp.startDate } else { $startDateStr }
+                }
+
+                $repeatCfgEntities[$repeatCfgId] = $repeatCfg
+                $repeatCfgIds.Add($repeatCfgId)
+                $task["repeatCfgId"] = $repeatCfgId
+            }
+        }
+
+        # Register parent task
+        $taskEntities[$taskId] = $task
+        $project.taskIds.Add($taskId) | Out-Null
+
+        # --- subtasks (checklistItems) ---
+        if ($msTask.PSObject.Properties.Name -contains 'checklistItems' -and
+            $msTask.checklistItems) {
+            foreach ($item in $msTask.checklistItems) {
+                if ([string]::IsNullOrWhiteSpace($item.displayName)) { continue }
+                $subId = New-SPId
+                $subCreated = $NowMs
+                $dto = Parse-Dto $item.createdDateTime
+                if ($dto) { $subCreated = $dto.ToUnixTimeMilliseconds() }
+
+                $subTask = [ordered]@{
+                    id             = $subId
+                    title          = $item.displayName
+                    projectId      = $projectId
+                    parentId       = $taskId
+                    isDone         = [bool]$item.isChecked
+                    created        = $subCreated
+                    modified       = $subCreated
+                    subTaskIds     = @()
+                    tagIds         = @()
+                    timeSpentOnDay = [ordered]@{}
+                    timeEstimate   = 0
+                    timeSpent      = 0
+                    hasPlannedTime = $false
+                    attachments    = @()
+                }
+                $taskEntities[$subId] = $subTask
+                $task.subTaskIds.Add($subId) | Out-Null
+            }
         }
     }
 }
 
-# Set imported tag ids
-$importedTagIds = $tagEntities.Keys
+# ---------------------------------------------------------------------------
+# Finalise: convert List<string> → plain arrays for JSON serialisation
+# ---------------------------------------------------------------------------
 
-# Initialize SP data structure
-$sp = @{
-    task          = @{
-        ids                   = @()
-        entities              = @{}
+foreach ($id in @($taskEntities.Keys)) {
+    $t = $taskEntities[$id]
+    if ($t.subTaskIds -is [System.Collections.Generic.List[string]]) {
+        $t.subTaskIds = @($t.subTaskIds)
+    }
+    if ($t.tagIds -is [System.Collections.Generic.List[string]]) {
+        $t.tagIds = @($t.tagIds)
+    }
+}
+
+foreach ($id in @($projectIds)) {
+    if ($projectEntities[$id].taskIds -is [System.Collections.Generic.List[string]]) {
+        $projectEntities[$id].taskIds = @($projectEntities[$id].taskIds)
+    }
+}
+
+foreach ($id in @($tagEntities.Keys)) {
+    if ($tagEntities[$id].taskIds -is [System.Collections.Generic.List[string]]) {
+        $tagEntities[$id].taskIds = @($tagEntities[$id].taskIds)
+    }
+}
+
+# Ensure repeatCfg tagIds are plain arrays
+foreach ($id in @($repeatCfgIds)) {
+    $rc = $repeatCfgEntities[$id]
+    if ($rc.tagIds -is [System.Collections.Generic.List[string]]) {
+        $rc.tagIds = @($rc.tagIds)
+    }
+}
+
+# Build ordered tag ids: imported tags alphabetically, then TODAY_TAG last
+# (TODAY always exists in the state; its position in menuTree puts it first)
+$tagIds = [System.Collections.Generic.List[string]]::new()
+foreach ($id in @($tagEntities.Keys)) {
+    if ($id -ne $TODAY_ID) { $tagIds.Add($id) }
+}
+$tagIds.Add($TODAY_ID)
+
+# ---------------------------------------------------------------------------
+# Build menuTree
+# Using k="p" for project node, k="t" for tag node, k="f" for folder
+# ---------------------------------------------------------------------------
+
+$projectTree = @()
+if ($importedProjectIds.Count -gt 0) {
+    $children = @()
+    foreach ($_pid in $importedProjectIds) { $children += @{ k = "p"; id = $_pid } }
+    $projectTree = @(@{
+            k          = "f"
+            id         = [guid]::NewGuid().ToString()
+            name       = "MS-Imported"
+            isExpanded = $true
+            children   = $children
+        })
+}
+
+# Tag tree: TODAY_TAG at root, imported tags in a folder
+$tagTree = @(@{ k = "t"; id = $TODAY_ID })
+$importedTagNodes = @()
+foreach ($id in @($tagIds)) {
+    if ($id -ne $TODAY_ID) { $importedTagNodes += @{ k = "t"; id = $id } }
+}
+if ($importedTagNodes.Count -gt 0) {
+    $tagTree += @{
+        k          = "f"
+        id         = [guid]::NewGuid().ToString()
+        name       = "MS-Imported Tags"
+        isExpanded = $true
+        children   = $importedTagNodes
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Assemble AppDataComplete
+# ---------------------------------------------------------------------------
+
+$appData = [ordered]@{
+    task           = [ordered]@{
+        ids                   = @($taskEntities.Keys)
+        entities              = $taskEntities
         currentTaskId         = $null
         selectedTaskId        = $null
         taskDetailTargetPanel = $null
         lastCurrentTaskId     = $null
         isDataLoaded          = $true
     }
-    project       = @{
-        ids      = @()
-        entities = @{}
+    project        = [ordered]@{
+        ids      = @($projectIds)
+        entities = $projectEntities
     }
-    tag           = @{
-        ids      = $tagEntities.Keys
+    tag            = [ordered]@{
+        ids      = @($tagIds)
         entities = $tagEntities
     }
-    taskRepeatCfg = @{
-        ids      = @()
-        entities = @{}
+    taskRepeatCfg  = [ordered]@{
+        ids      = @($repeatCfgIds)
+        entities = $repeatCfgEntities
     }
-    simpleCounter = @{
+    simpleCounter  = [ordered]@{
         ids      = @()
-        entities = @{}
+        entities = [ordered]@{}
     }
-    metric        = @{
+    metric         = [ordered]@{
         ids      = @()
-        entities = @{}
+        entities = [ordered]@{}
     }
-    reminders     = @()
-    planner       = @{
-        ids      = @()
-        entities = @{}
-        days     = @{}
+    reminders      = @($remindersList)
+    planner        = [ordered]@{
+        days                           = [ordered]@{}
+        addPlannedTasksDialogLastShown = $null
     }
-    boards        = @{
-        ids       = @()
-        entities  = @{}
+    boards         = [ordered]@{
         boardCfgs = @()
     }
-    note          = @{
+    note           = [ordered]@{
         ids        = @()
-        entities   = @{}
+        entities   = [ordered]@{}
         todayOrder = @()
     }
-    issueProvider = @{
+    issueProvider  = [ordered]@{
         ids      = @()
-        entities = @{}
+        entities = [ordered]@{}
     }
-    menuTree      = @{
-        projectTree = @()
-        tagTree     = @()
+    menuTree       = [ordered]@{
+        projectTree = $projectTree
+        tagTree     = $tagTree
     }
-    globalConfig  = @{
-        appFeatures  = @{
-            isTimeTrackingEnabled     = $true
-            isFocusModeEnabled        = $true
-            isSchedulerEnabled        = $true
-            isPlannerEnabled          = $true
-            isBoardsEnabled           = $true
-            isScheduleDayPanelEnabled = $true
-            isIssuesPanelEnabled      = $true
-            isProjectNotesEnabled     = $true
-            isSyncIconEnabled         = $true
-            isDonatePageEnabled       = $true
-            isEnableUserProfiles      = $true
-            isHabitsEnabled           = $true
-        }
-        localization = @{}
-        misc         = @{
+    timeTracking   = [ordered]@{
+        project = [ordered]@{}
+        tag     = [ordered]@{}
+    }
+    archiveYoung   = [ordered]@{
+        task                  = [ordered]@{ ids = @(); entities = [ordered]@{} }
+        timeTracking          = [ordered]@{ project = [ordered]@{}; tag = [ordered]@{} }
+        lastTimeTrackingFlush = 0
+    }
+    archiveOld     = [ordered]@{
+        task                  = [ordered]@{ ids = @(); entities = [ordered]@{} }
+        timeTracking          = [ordered]@{ project = [ordered]@{}; tag = [ordered]@{} }
+        lastTimeTrackingFlush = 0
+    }
+    pluginMetadata = @()
+    pluginUserData = @()
+    # Minimal globalConfig – the app's data-repair will fill in any missing keys
+    globalConfig   = [ordered]@{
+        misc         = [ordered]@{
             isConfirmBeforeExit                 = $false
             isConfirmBeforeExitWithoutFinishDay = $false
             isMinimizeToTray                    = $false
             startOfNextDay                      = 0
             isDisableAnimations                 = $false
         }
-        tasks        = @{
+        tasks        = [ordered]@{
             isAutoMarkParentAsDone             = $false
-            isAutoAddWorkedOnToToday           = $false
-            isTrayShowCurrent                  = $false
             isMarkdownFormattingInNotesEnabled = $true
             notesTemplate                      = ""
         }
-        shortSyntax  = @{
+        shortSyntax  = [ordered]@{
             isEnableProject = $true
             isEnableDue     = $true
             isEnableTag     = $true
         }
-        evaluation   = @{
-            isHideEvaluationSheet = $false
-        }
-        idle         = @{
+        evaluation   = [ordered]@{ isHideEvaluationSheet = $false }
+        idle         = [ordered]@{
             isEnableIdleTimeTracking      = $false
             minIdleTime                   = 60000
             isOnlyOpenIdleWhenCurrentTask = $false
         }
-        takeABreak   = @{
-            isTakeABreakEnabled            = $false
-            isLockScreen                   = $false
-            isTimedFullScreenBlocker       = $false
-            timedFullScreenBlockerDuration = 5000
-            isFocusWindow                  = $false
-            takeABreakMessage              = "Take a break!"
-            takeABreakMinWorkingTime       = 1800000
-            takeABreakSnoozeTime           = 300000
-            motivationalImgs               = @()
+        takeABreak   = [ordered]@{
+            isTakeABreakEnabled      = $false
+            takeABreakMessage        = "Take a break!"
+            takeABreakMinWorkingTime = 1800000
+            motivationalImgs         = @()
         }
-        pomodoro     = @{
-            cyclesBeforeLongerBreak = 4
-        }
-        keyboard     = @{}
-        localBackup  = @{
-            isEnabled = $false
-        }
-        sound        = @{
+        pomodoro     = [ordered]@{ cyclesBeforeLongerBreak = 4 }
+        sound        = [ordered]@{
             isIncreaseDoneSoundPitch = $false
             doneSound                = $null
             breakReminderSound       = $null
             volume                   = 50
         }
-        timeTracking = @{
+        timeTracking = [ordered]@{
             isAutoStartNextTask              = $false
             isNotifyWhenTimeEstimateExceeded = $false
             isTrackingReminderEnabled        = $false
-            isTrackingReminderShowOnMobile   = $false
             trackingReminderMinTime          = 0
         }
-        reminder     = @{
-            isCountdownBannerEnabled = $false
-            countdownDuration        = 60000
-        }
-        schedule     = @{
+        schedule     = [ordered]@{
             isWorkStartEndEnabled = $false
             workStart             = "09:00"
             workEnd               = "17:00"
-            isLunchBreakEnabled   = $false
-            lunchBreakStart       = "12:00"
-            lunchBreakEnd         = "13:00"
         }
-        dominaMode   = @{
-            isEnabled = $false
-            text      = ""
-            interval  = 10000
-            volume    = 50
-        }
-        focusMode    = @{
-            isSkipPreparation = $false
-        }
-        sync         = @{
+        sync         = [ordered]@{
             isEnabled    = $false
             syncProvider = $null
             syncInterval = 300000
@@ -251,283 +848,45 @@ $sp = @{
     }
 }
 
+# ---------------------------------------------------------------------------
+# Wrap in CompleteBackup format (recognized by importCompleteBackup())
+# ---------------------------------------------------------------------------
 
-# Process each list (convert to projects)
-foreach ($list in $msTodo.lists) {
-    $projectId = New-SPId
-
-    # Create project entity
-    $project = @{
-        id               = $projectId
-        title            = $list.displayName
-        taskIds          = @()
-        icon             = "list"  # Default icon # TODO: Map from MS Todo if possible
-        isHiddenFromMenu = $false
-        isArchived       = $false
-        isEnableBacklog  = $false
-        backlogTaskIds   = @()
-        noteIds          = @()
-        advancedCfg      = @{
-            worklogExportSettings = @{
-                cols            = @("DATE", "START", "END", "TIME_CLOCK", "TITLES_INCLUDING_SUB")
-                separateTasksBy = " | "
-                groupBy         = "DATE"
-            }
-        }
-        theme            = @{
-            isAutoContrast          = $true
-            isDisableBackgroundTint = $false
-            primary                 = "#42a5f5"
-            huePrimary              = "500"
-            accent                  = "#ff4081"
-            hueAccent               = "500"
-            warn                    = "#e11826"
-            hueWarn                 = "500"
-        }
-    }
-
-    # Add project to SP data
-    $sp.project.ids += $projectId
-    $sp.project.entities[$projectId] = $project
-
-    # Add to imported projects
-    $importedProjectIds += $projectId
-
-    # Process tasks for this list
-    if ($msTodo.tasks.PSObject.Properties[$list.id]) {
-        foreach ($msTask in $msTodo.tasks.($list.id)) {
-            $taskId = New-SPId
-
-            # Parse timestamps
-            # TODO: Handle potential nulls and parsing errors, extract parser to function
-            $created = [DateTimeOffset]::Parse($msTask.createdDateTime).ToUnixTimeMilliseconds()
-            $modified = [DateTimeOffset]::Parse($msTask.lastModifiedDateTime).ToUnixTimeMilliseconds()
-            $doneOn = $null
-            if ($msTask.status -eq "completed" -and $msTask.completedDateTime -and $msTask.completedDateTime.dateTime) {
-                $doneOn = [DateTimeOffset]::Parse($msTask.completedDateTime.dateTime).ToUnixTimeMilliseconds()
-            }
-
-            # Collect tagIds
-            $tagIds = @()
-            if ($msTask.importance -eq "high") {
-                $importantTagId = ($tagEntities.GetEnumerator() | Where-Object { $_.Value.title -eq "Important" }).Key
-                if ($importantTagId) {
-                    $tagIds += $importantTagId
-                }
-            }
-            if ($msTask.categories) {
-                foreach ($cat in $msTask.categories) {
-                    $catTagId = ($tagEntities.GetEnumerator() | Where-Object { $_.Value.title -eq $cat }).Key
-                    if ($catTagId) {
-                        $tagIds += $catTagId
-                    }
-                }
-            }
-
-            # Create task entity
-            $task = @{
-                id             = $taskId
-                title          = $msTask.title
-                projectId      = $projectId
-                isDone         = ($msTask.status -eq "completed")
-                created        = $created
-                modified       = $modified
-                # Additional required fields
-                subTaskIds     = @()
-                tagIds         = $tagIds
-                timeSpentOnDay = @{}
-                timeEstimate   = 0
-                timeSpent      = 0
-                hasPlannedTime = $false
-                attachments    = @()
-            }
-
-            # Add optional fields only if not null
-            Add-IfNotNull $task "doneOn" $doneOn
-            Add-IfNotNull $task "parentId" $null
-            Add-IfNotNull $task "reminderId" $null
-            Add-IfNotNull $task "repeatCfgId" $null
-            Add-IfNotNull $task "dueWithTime" $null
-            Add-IfNotNull $task "dueDay" $null
-            Add-IfNotNull $task "remindAt" $null # TODO: Issue: remindAt is set to $null (line 354) but there's no code to parse reminderDateTime from MS Todo and map it to SP's reminder options
-            Add-IfNotNull $task "_hideSubTasksMode" $null
-            Add-IfNotNull $task "issueId" $null
-            Add-IfNotNull $task "issueProviderId" $null
-            Add-IfNotNull $task "issueType" $null
-            Add-IfNotNull $task "issueWasUpdated" $null
-            Add-IfNotNull $task "issueLastUpdated" $null
-            Add-IfNotNull $task "issueAttachmentNr" $null
-            Add-IfNotNull $task "issueTimeTracked" $null
-            Add-IfNotNull $task "issuePoints" $null
-
-            # Add notes if body content exists
-            if ($msTask.body -and $msTask.body.content -and $msTask.body.content.Trim()) {
-                $task["notes"] = $msTask.body.content.Trim()
-            }
-
-            # Handle recurrence
-            if ($msTask.recurrence) {
-                $repeatCfgId = New-SPId
-                $startDateStr = Get-DbDateStr ([DateTimeOffset]::FromUnixTimeMilliseconds($task.created))
-                $repeatCfg = @{
-                    id                        = $repeatCfgId
-                    projectId                 = $projectId
-                    lastTaskCreation          = $task.created
-                    lastTaskCreationDay       = $startDateStr
-                    title                     = "Recurring Task"
-                    tagIds                    = @()
-                    order                     = 0
-                    defaultEstimate           = 0
-                    startTime                 = $null
-                    remindAt                  = $null
-                    isPaused                  = $false
-                    quickSetting              = "DAILY"
-                    repeatCycle               = "DAILY"
-                    startDate                 = $null  # Optional, for monthly/yearly
-                    repeatEvery               = 1
-                    monday                    = $false
-                    tuesday                   = $false
-                    wednesday                 = $false
-                    thursday                  = $false
-                    friday                    = $false
-                    saturday                  = $false
-                    sunday                    = $false
-                    notes                     = $null
-                    shouldInheritSubtasks     = $false
-                    repeatFromCompletionDate  = $false
-                    disableAutoUpdateSubtasks = $false
-                    subTaskTemplates          = @()
-                    deletedInstanceDates      = @()
-                }
-
-                # Map recurrence pattern
-                $pattern = $msTask.recurrence.pattern
-                if ($pattern.type -eq "daily") {
-                    $repeatCfg.repeatCycle = "DAILY"
-                    $repeatCfg.repeatEvery = $pattern.interval
-                    $repeatCfg.quickSetting = "DAILY"
-                }
-                elseif ($pattern.type -eq "weekly") {
-                    $repeatCfg.repeatCycle = "WEEKLY"
-                    $repeatCfg.repeatEvery = $pattern.interval
-                    $repeatCfg.quickSetting = "WEEKLY_CURRENT_WEEKDAY" # TODO: Hardcoded without verification
-                    # Set days if specified
-                    if ($pattern.daysOfWeek) {
-                        foreach ($day in $pattern.daysOfWeek) {
-                            switch ($day) {
-                                "monday" { $repeatCfg.monday = $true }
-                                "tuesday" { $repeatCfg.tuesday = $true }
-                                "wednesday" { $repeatCfg.wednesday = $true }
-                                "thursday" { $repeatCfg.thursday = $true }
-                                "friday" { $repeatCfg.friday = $true }
-                                "saturday" { $repeatCfg.saturday = $true }
-                                "sunday" { $repeatCfg.sunday = $true }
-                            }
-                        }
-                    }
-                    else {
-                        # TODO: If no days specified, assume all days? But MS Todo weekly without days might be every week
-                        # For simplicity, set to current day or something. Let's set monday for now.
-                        $repeatCfg.monday = $true
-                    }
-                }
-                elseif ($pattern.type -eq "monthly") {
-                    $repeatCfg.repeatCycle = "MONTHLY"
-                    $repeatCfg.repeatEvery = $pattern.interval
-                    $repeatCfg.quickSetting = "MONTHLY_CURRENT_DATE"
-                    $repeatCfg.startDate = $startDateStr
-                }
-                elseif ($pattern.type -eq "yearly") {
-                    $repeatCfg.repeatCycle = "YEARLY"
-                    $repeatCfg.repeatEvery = $pattern.interval
-                    $repeatCfg.quickSetting = "YEARLY_CURRENT_DATE"
-                    $repeatCfg.startDate = $startDateStr
-                }
-
-                # TODO: Map range - for endDate, we don't have endDate field in model, so perhaps set isPaused or something
-                # The model doesn't have endDate, so maybe ignore or set deletedInstanceDates if needed
-                # For now, leave as is
-
-                $sp.taskRepeatCfg.entities[$repeatCfgId] = $repeatCfg
-                $sp.taskRepeatCfg.ids += $repeatCfgId
-                $task.repeatCfgId = $repeatCfgId
-            }
-
-            # Add task to SP data
-            $sp.task.entities[$taskId] = $task
-
-            # Add task ID to project's taskIds
-            $project.taskIds += $taskId
-
-            # Handle subtasks (checklistItems)
-            if ($msTask.checklistItems) {
-                foreach ($item in $msTask.checklistItems) {
-                    $subTaskId = New-SPId
-                    $subTask = @{
-                        id             = $subTaskId
-                        title          = $item.displayName
-                        projectId      = $projectId
-                        isDone         = $item.isChecked
-                        created        = [DateTimeOffset]::Parse($item.createdDateTime).ToUnixTimeMilliseconds()
-                        modified       = [DateTimeOffset]::Parse($item.createdDateTime).ToUnixTimeMilliseconds() # TODO: For subtasks, modified is set to the same value as created (line 470), assuming subtasks don't have separate modification times.
-                        parentId       = $taskId
-                        subTaskIds     = @()
-                        tagIds         = @()
-                        timeSpentOnDay = @{}
-                        timeEstimate   = 0
-                        timeSpent      = 0
-                        hasPlannedTime = $false
-                        attachments    = @()
-                    }
-                    $sp.task.entities[$subTaskId] = $subTask
-                    $sp.task.ids += $subTaskId
-                    $task.subTaskIds += $subTaskId
-                }
-            }
-        }
-    }
+$output = [ordered]@{
+    timestamp         = $NowMs
+    lastUpdate        = $NowMs
+    crossModelVersion = 4.5
+    data              = $appData
 }
 
-# Set task ids
-$sp.task.ids = $sp.task.entities.Keys
+# ---------------------------------------------------------------------------
+# Serialize and write output
+# ---------------------------------------------------------------------------
 
-# Build menuTree
-if ($importedProjectIds.Count -gt 0) {
-    $projectFolderId = [guid]::NewGuid().ToString()
-    $projectChildren = @()
-    foreach ($projId in $importedProjectIds) {
-        $projectChildren += @{ k = "p"; id = $projId }
-    }
-    $sp.menuTree.projectTree = @(
-        @{
-            k          = "f"
-            id         = $projectFolderId
-            name       = "MS-IMPORT-PROJECTS"
-            isExpanded = $true
-            children   = $projectChildren
-        }
-    )
+$json = $output | ConvertTo-Json -Depth 20
+
+# Ensure parent directory exists
+$outDir = Split-Path $OutputFile -Parent
+if ($outDir -and -not (Test-Path $outDir)) {
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 }
 
-if ($importedTagIds.Count -gt 0) {
-    $tagFolderId = [guid]::NewGuid().ToString()
-    $tagChildren = @()
-    foreach ($tid in $importedTagIds) {
-        $tagChildren += @{ k = "t"; id = $tid }
-    }
-    $sp.menuTree.tagTree = @(
-        @{
-            k          = "f"
-            id         = $tagFolderId
-            name       = "MS-IMPORT-TAGS"
-            isExpanded = $true
-            children   = $tagChildren
-        }
-    )
-}
+[System.IO.File]::WriteAllText(
+    [System.IO.Path]::GetFullPath($OutputFile),
+    $json,
+    [System.Text.Encoding]::UTF8
+)
 
-# Convert to JSON and save
-$spJson = $sp | ConvertTo-Json -Depth 10
-$spJson | Out-File -FilePath $OutputFile -Encoding UTF8
+$taskCount = @($taskEntities.Keys).Count
+$projectCount = $projectIds.Count
+$tagCount = $tagIds.Count - 1   # exclude TODAY_TAG
+$repeatCount = $repeatCfgIds.Count
+$reminderCount = $remindersList.Count
 
-Write-Host "Conversion complete. Output saved to $OutputFile"
+Write-Host "Conversion complete."
+Write-Host "  Projects : $projectCount"
+Write-Host "  Tasks    : $taskCount (incl. subtasks)"
+Write-Host "  Tags     : $tagCount (+ TODAY tag)"
+Write-Host "  Repeats  : $repeatCount"
+Write-Host "  Reminders: $reminderCount"
+Write-Host "  Output   : $([System.IO.Path]::GetFullPath($OutputFile))"
