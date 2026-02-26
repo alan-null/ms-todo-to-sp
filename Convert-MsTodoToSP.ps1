@@ -865,14 +865,16 @@ $output = [ordered]@{
 
 $json = $output | ConvertTo-Json -Depth 20
 
+$resolvedOutputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFile)
+
 # Ensure parent directory exists
-$outDir = Split-Path $OutputFile -Parent
+$outDir = Split-Path $resolvedOutputFile -Parent
 if ($outDir -and -not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 }
 
 [System.IO.File]::WriteAllText(
-    [System.IO.Path]::GetFullPath($OutputFile),
+    $resolvedOutputFile,
     $json,
     [System.Text.Encoding]::UTF8
 )
@@ -889,4 +891,4 @@ Write-Host "  Tasks    : $taskCount (incl. subtasks)"
 Write-Host "  Tags     : $tagCount (+ TODAY tag)"
 Write-Host "  Repeats  : $repeatCount"
 Write-Host "  Reminders: $reminderCount"
-Write-Host "  Output   : $([System.IO.Path]::GetFullPath($OutputFile))"
+Write-Host "  Output   : $resolvedOutputFile"
