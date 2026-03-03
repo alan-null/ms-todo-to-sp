@@ -1,15 +1,53 @@
-# MS Todo to Super Productivity Migration
+# MS Todo to Super Productivity Migration Tools
 
-## Overview
-This document summarizes the PowerShell script developed to convert **Microsoft To Do** JSON exports to **Super Productivity** compatible format.
+This repository contains PowerShell scripts for migrating data from Microsoft To Do to **Super Productivity** (SP), and for merging existing SP backups.
 
-The script handles comprehensive data migration including `tasks`, `projects`, `subtasks`, `tags`, `due dates`, `reminders`, and `recurrence` patterns.
+## Scripts Overview
+
+| Script                                           | Description                                                                   |
+| ------------------------------------------------ | ----------------------------------------------------------------------------- |
+| [Convert-MsTodoToSP.ps1](Convert-MsTodoToSP.ps1) | Converts Microsoft To Do JSON exports to SP compatible format.                |
+| [Merge-SPBackups.ps1](Merge-SPBackups.ps1)       | Merges two Super Productivity backup JSON files into a single unified backup. |
+
+## Table of Contents
+
+- [1. Microsoft To Do to Super Productivity Migration](#1-microsoft-to-do-to-super-productivity-migration)
+  - [Overview](#overview)
+  - [Usage](#usage)
+  - [Object Mappings](#object-mappings)
+    - [Projects (MS Todo Lists → SP Projects)](#projects-ms-todo-lists--sp-projects)
+    - [Tasks (MS Todo Tasks → SP Tasks)](#tasks-ms-todo-tasks--sp-tasks)
+    - [Subtasks (MS Todo checklistItems → SP Subtasks)](#subtasks-ms-todo-checklistitems--sp-subtasks)
+    - [Recurrence Configurations (MS Todo recurrence → SP taskRepeatCfg)](#recurrence-configurations-ms-todo-recurrence--sp-taskrepeatcfg)
+  - [Example Output](#example-output)
+- [2. Super Productivity Backup Merger](#2-super-productivity-backup-merger)
+  - [Overview](#overview-1)
+  - [Usage](#usage-1)
+  - [Parameters](#parameters)
+  - [Duplicate Detection](#duplicate-detection)
+    - [Projects](#projects)
+    - [Tags](#tags)
+    - [Tasks](#tasks)
+  - [Example Output](#example-output-1)
+
+
+---
+
+## 1. Microsoft To Do to Super Productivity Migration
+
+### Overview
+The [Convert-MsTodoToSP.ps1](Convert-MsTodoToSP.ps1) script handles comprehensive data migration including `tasks`, `projects`, `subtasks`, `tags`, `due dates`, `reminders`, and `recurrence` patterns.
 
 > All IDs are 21-character base64url strings (nanoid-style), not GUIDs.
 
-## Object Mappings
+### Usage
+```powershell
+.\Convert-MsTodoToSP.ps1 -InputFile "path\to\ms-todo.json" -OutputFile "output.json"
+```
 
-### Projects (MS Todo Lists → SP Projects)
+### Object Mappings
+
+#### Projects (MS Todo Lists → SP Projects)
 MS Todo lists are converted to SP projects and grouped under a single `"MS-Imported"` folder in the menu tree.
 
 | MS Todo List Field | SP Project Field   | Notes                                              |
@@ -26,7 +64,7 @@ MS Todo lists are converted to SP projects and grouped under a single `"MS-Impor
 | N/A                | `backlogTaskIds`   | Empty array                                        |
 | N/A                | `noteIds`          | Empty array                                        |
 
-### Tasks (MS Todo Tasks → SP Tasks)
+#### Tasks (MS Todo Tasks → SP Tasks)
 Core task data with all MS Todo features mapped.
 
 | MS Todo Task Field                           | SP Task Field    | Notes                                                                                                |
@@ -53,7 +91,7 @@ Core task data with all MS Todo features mapped.
 | N/A                                          | `hasPlannedTime` | `true` if `dueDay` or `dueWithTime` is set, otherwise `false`                                        |
 | N/A                                          | `attachments`    | Empty array                                                                                          |
 
-### Subtasks (MS Todo checklistItems → SP Subtasks)
+#### Subtasks (MS Todo checklistItems → SP Subtasks)
 Checklist items become subtasks linked to their parent task.
 
 | MS Todo checklistItem Field | SP Subtask Field | Notes                                     |
@@ -73,22 +111,7 @@ Checklist items become subtasks linked to their parent task.
 | N/A                         | `hasPlannedTime` | `false`                                   |
 | N/A                         | `attachments`    | Empty array                               |
 
-### Tags (MS Todo Sources → SP Tags)
-Tags are collected from three sources in a first-pass scan: `categories`, `importance = "high"` (→ `"Important"`), and inline `#tags` in task titles. A mandatory `TODAY` tag (id = `"TODAY"`) is always created.
-
-| Source                  | SP Tag Field  | Notes                                               |
-| ----------------------- | ------------- | --------------------------------------------------- |
-| Category name / hashtag | `title`       | Direct mapping                                      |
-| N/A                     | `id`          | Random 21-char base64url ID (assigned at runtime)   |
-| N/A                     | `taskIds`     | Back-filled with IDs of tasks that use the tag      |
-| N/A                     | `color`       | `null`                                              |
-| N/A                     | `created`     | Script run timestamp                                |
-| N/A                     | `modified`    | Script run timestamp                                |
-| N/A                     | `icon`        | `null` (imported tags); `"wb_sunny"` for TODAY      |
-| N/A                     | `advancedCfg` | Default worklog export settings                     |
-| N/A                     | `theme`       | Default tag theme (`#a05db1`); TODAY uses `#6495ED` |
-
-### Recurrence Configurations (MS Todo recurrence → SP taskRepeatCfg)
+#### Recurrence Configurations (MS Todo recurrence → SP taskRepeatCfg)
 Repeat configs are created only for **incomplete** tasks that have a `recurrence.pattern`. Completed recurring tasks are treated as historical instances and migrated as plain done tasks.
 
 | MS Todo Recurrence Field                       | SP RepeatCfg Field         | Notes                                                                                                                                                                                           |
@@ -111,30 +134,93 @@ Repeat configs are created only for **incomplete** tasks that have a `recurrence
 | N/A                                            | `repeatFromCompletionDate` | `false`                                                                                                                                                                                         |
 | N/A                                            | `deletedInstanceDates`     | Empty array                                                                                                                                                                                     |
 
-### Reminders
-A SP reminder entity is created when `isReminderOn = true` and `reminderDateTime.dateTime` is present and parseable. The absolute time is stored directly — no relative-offset mapping is applied.
 
-| MS Todo Field               | SP Reminder Field | Notes                       |
-| --------------------------- | ----------------- | --------------------------- |
-| `reminderDateTime.dateTime` | `remindAt`        | Absolute Unix ms timestamp  |
-| `title`                     | `title`           | Copied from the task title  |
-| N/A                         | `id`              | Random 21-char base64url ID |
-| N/A                         | `type`            | `"TASK"`                    |
-| N/A                         | `relatedId`       | The task's ID               |
+### Example Output
 
-## Organizational Structure
-- **Project folder**: All imported projects are placed under a single `"MS-Imported"` folder in the project menu tree.
-- **Tag folder**: Imported tags (excluding `TODAY`) are placed under a `"MS-Imported Tags"` folder in the tag menu tree. The `TODAY` tag always appears at the root of the tag tree.
-- **Tag ID ordering**: Imported tags are stored alphabetically (case-insensitive); `TODAY` is appended last.
-
-## Data Integrity Features
-- Graceful timestamp parsing — falls back to `$NowMs` on invalid or missing values
-- Complete entity structures to prevent SP UI errors on import
-- Bidirectional task↔tag relationships (`task.tagIds` ↔ `tag.taskIds`)
-- `List<string>` collections are converted to plain arrays before JSON serialisation to avoid `{}` objects in output
-- UTF-8 encoding for international characters
-
-## Usage
 ```powershell
-.\Convert-MsTodoToSP.ps1 -InputFile "path\to\ms-todo.json" -OutputFile "output.json"
+pwsh .\Convert-MsTodoToSP.ps1 -InputFile .\input\microsoft-todo-backup.json -OutputFile ".\out\ms-converted.json"
+
+Conversion complete.
+  Projects : 29
+  Tasks    : 2005 (incl. subtasks)
+  Tags     : 13 (+ TODAY tag)
+  Repeats  : 39
+  Reminders: 24
+  Output   : C:\repo\ms-todo-to-sp\out\ms-converted.json
+```
+
+---
+
+## 2. Super Productivity Backup Merger
+
+### Overview
+The [Merge-SPBackups.ps1](Merge-SPBackups.ps1) script merges two **Super Productivity** (SP) backup JSON files into a single unified backup.
+
+The **Primary** file is the base — its data is preserved — and unique data from the **Secondary** file is merged in with full deduplication and conflict resolution.
+
+Designed for SP backup format version **4.5** (`crossModelVersion`).
+
+### Usage
+```powershell
+.\Merge-SPBackups.ps1 -PrimaryFile "a.json" -SecondaryFile "b.json" -OutputFile "merged.json"
+```
+
+### Parameters
+
+| Parameter        | Default                                | Description                                |
+| ---------------- | -------------------------------------- | ------------------------------------------ |
+| `-PrimaryFile`   | `input\super-productivity-backup.json` | Base backup file (its data takes priority) |
+| `-SecondaryFile` | `out\dist.json`                        | Backup to merge into the primary           |
+| `-OutputFile`    | `out\merged.json`                      | Path for the merged output file            |
+
+### Duplicate Detection
+
+Every entity type uses a two-tier matching strategy:
+
+#### Projects
+1. **By ID** — exact match of project ID
+2. **By title** — case-insensitive title comparison
+
+#### Tags
+1. **By ID** — exact match (including well-known `"TODAY"`)
+2. **By title** — case-insensitive title comparison
+
+#### Tasks
+1. **By ID** — exact match of task ID
+2. **By title + project** — case-insensitive title within the same (mapped) project
+3. **Instance guard** — title matches are confirmed via `created`, `doneOn`, `dueDay`, etc.
+
+### Example Output
+
+```powershell
+pwsh .\Merge-SPBackups.ps1 -PrimaryFile .\input\sp-backup.json -SecondaryFile .\out\ms-converted.json -OutputFile .\out\sp-and-ms.json
+
+=============================================
+ Merge complete
+=============================================
+
+  Source stats:
+                  Primary  Secondary
+    Projects:           3         29
+    Tasks:              2       2005
+    Subtasks:           0          0
+    Tags:               1         13
+    Repeats:            0         39
+    Reminders:          0         24
+
+  Merge actions:
+    Projects  : 0 matched, 29 added
+    Tags      : 0 matched, 13 added
+    Tasks     : 0 merged, 1317 added, 0 unchanged
+    Subtasks  : 0 merged, 688 added
+    RepeatCfgs: 0 matched, 39 added
+    Reminders : 24 added
+
+  Output totals:
+    Projects  : 32
+    Tasks     : 2007 (incl. subtasks)
+    Tags      : 14 (+ TODAY)
+    RepeatCfgs: 39
+    Reminders : 24
+    Output    : C:\repo\ms-todo-to-sp\out\sp-and-ms.json
 ```
