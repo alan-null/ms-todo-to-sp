@@ -1,8 +1,8 @@
 # PowerShell script to convert Microsoft To Do JSON export to Super Productivity BACKUP format
 #
 # Supported input formats:
-#   1. lists.json  – flat array of list objects, each with an embedded "tasks" array
-#   2. ms-todo.json – object with { "lists": [...], "tasks": { "<listId>": [...] } }
+#   1. lists.json  - flat array of list objects, each with an embedded "tasks" array
+#   2. ms-todo.json - object with { "lists": [...], "tasks": { "<listId>": [...] } }
 #
 # Output: CompleteBackup JSON ready to import into Super Productivity
 #   (Settings → Sync & Backup → Import from File)
@@ -138,7 +138,7 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# Pass 1 – collect all unique tag names from categories + importance
+# Pass 1 - collect all unique tag names from categories + importance
 # ---------------------------------------------------------------------------
 
 $tagNameSet = [System.Collections.Generic.SortedSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -189,7 +189,7 @@ foreach ($name in $tagNameSet) {
     }
 }
 
-# TODAY_TAG – a mandatory virtual tag; id must equal 'TODAY'
+# TODAY_TAG - a mandatory virtual tag; id must equal 'TODAY'
 $TODAY_ID = 'TODAY'
 $tagEntities[$TODAY_ID] = [ordered]@{
     id          = $TODAY_ID
@@ -221,15 +221,15 @@ $repeatCfgOrder = 0
 # Returns a hashtable with SP repeat fields, or $null if pattern is unrecognised.
 #
 # MS Graph pattern types:
-#   daily            – every N days
-#   weekly           – every N weeks on daysOfWeek
-#   absoluteMonthly  – every N months on dayOfMonth
-#   relativeMonthly  – every N months on Nth weekday (e.g. "second Tuesday")
+#   daily            - every N days
+#   weekly           - every N weeks on daysOfWeek
+#   absoluteMonthly  - every N months on dayOfMonth
+#   relativeMonthly  - every N months on Nth weekday (e.g. "second Tuesday")
 #                      → mapped to MONTHLY (best approximation, weekday constraint lost)
-#   absoluteYearly   – every N years on month/dayOfMonth
-#   relativeYearly   – every N years on Nth weekday of month
+#   absoluteYearly   - every N years on month/dayOfMonth
+#   relativeYearly   - every N years on Nth weekday of month
 #                      → mapped to YEARLY (best approximation)
-#   hourly           – every N hours → mapped to DAILY (closest SP option)
+#   hourly           - every N hours → mapped to DAILY (closest SP option)
 # ---------------------------------------------------------------------------
 function Convert-RecurrencePattern {
     param(
@@ -251,94 +251,86 @@ function Convert-RecurrencePattern {
     $setDays = {
         param([object[]]$dayNames)
         foreach ($d in $dayNames) {
-            switch ($d.ToString().ToLower()) {
-                "monday" { $days.mon = $true }
-                "tuesday" { $days.tue = $true }
-                "wednesday" { $days.wed = $true }
-                "thursday" { $days.thu = $true }
-                "friday" { $days.fri = $true }
-                "saturday" { $days.sat = $true }
-                "sunday" { $days.sun = $true }
-            }
+            $dl = $d.ToString().ToLower()
+            if      ($dl -eq "monday")    { $days.mon = $true }
+            elseif  ($dl -eq "tuesday")   { $days.tue = $true }
+            elseif  ($dl -eq "wednesday") { $days.wed = $true }
+            elseif  ($dl -eq "thursday")  { $days.thu = $true }
+            elseif  ($dl -eq "friday")    { $days.fri = $true }
+            elseif  ($dl -eq "saturday")  { $days.sat = $true }
+            elseif  ($dl -eq "sunday")    { $days.sun = $true }
         }
     }
 
     # Script block: set the flag for whatever weekday $createdDate falls on
     $setCreatedDay = {
-        switch ($createdDate.DayOfWeek) {
-            ([DayOfWeek]::Monday) { $days.mon = $true }
-            ([DayOfWeek]::Tuesday) { $days.tue = $true }
-            ([DayOfWeek]::Wednesday) { $days.wed = $true }
-            ([DayOfWeek]::Thursday) { $days.thu = $true }
-            ([DayOfWeek]::Friday) { $days.fri = $true }
-            ([DayOfWeek]::Saturday) { $days.sat = $true }
-            ([DayOfWeek]::Sunday) { $days.sun = $true }
-        }
+        $dow = $createdDate.DayOfWeek
+        if      ($dow -eq [DayOfWeek]::Monday)    { $days.mon = $true }
+        elseif  ($dow -eq [DayOfWeek]::Tuesday)   { $days.tue = $true }
+        elseif  ($dow -eq [DayOfWeek]::Wednesday) { $days.wed = $true }
+        elseif  ($dow -eq [DayOfWeek]::Thursday)  { $days.thu = $true }
+        elseif  ($dow -eq [DayOfWeek]::Friday)    { $days.fri = $true }
+        elseif  ($dow -eq [DayOfWeek]::Saturday)  { $days.sat = $true }
+        elseif  ($dow -eq [DayOfWeek]::Sunday)    { $days.sun = $true }
     }
 
     $repeatCycle = $null
     $startDate = $null
 
-    switch ($patType.ToLower()) {
+    $pt = $patType.ToLower()
 
-        "daily" {
-            $repeatCycle = "DAILY"
+    if ($pt -eq "daily") {
+        $repeatCycle = "DAILY"
+    }
+    elseif ($pt -eq "hourly") {
+        # SP has no hourly option; DAILY is the closest approximation
+        $repeatCycle = "DAILY"
+        $interval = 1
+        Write-Warning "  [recurrence] 'hourly' pattern mapped to DAILY (SP has no hourly repeat)."
+    }
+    elseif ($pt -eq "weekly") {
+        $repeatCycle = "WEEKLY"
+        $hasDays = ($pattern.PSObject.Properties.Name -contains 'daysOfWeek') -and
+        $pattern.daysOfWeek -and
+        $pattern.daysOfWeek.Count -gt 0
+        if ($hasDays) { & $setDays $pattern.daysOfWeek }
+        else { & $setCreatedDay }
+    }
+    elseif ($pt -eq "absolutemonthly" -or $pt -eq "relativemonthly") {
+        $repeatCycle = "MONTHLY"
+
+        # Prefer dueDate's day; fall back to dayOfMonth field; then createdDate
+        if (-not [string]::IsNullOrWhiteSpace($dueDateStr)) {
+            $dto = Parse-Dto $dueDateStr
+            if ($dto) { $startDate = Get-DbDateStr $dto }
         }
-
-        "hourly" {
-            # SP has no hourly option; DAILY is the closest approximation
-            $repeatCycle = "DAILY"
-            $interval = 1
-            Write-Warning "  [recurrence] 'hourly' pattern mapped to DAILY (SP has no hourly repeat)."
+        if (-not $startDate -and
+            $pattern.PSObject.Properties.Name -contains 'dayOfMonth' -and
+            $pattern.dayOfMonth -gt 0) {
+            $startDate = Get-DbDateStrFromDayOfMonth $createdDate ([int]$pattern.dayOfMonth)
         }
+        if (-not $startDate) { $startDate = Get-DbDateStr $createdDate }
 
-        "weekly" {
-            $repeatCycle = "WEEKLY"
-            $hasDays = ($pattern.PSObject.Properties.Name -contains 'daysOfWeek') -and
-            $pattern.daysOfWeek -and
-            $pattern.daysOfWeek.Count -gt 0
-            if ($hasDays) { & $setDays $pattern.daysOfWeek }
-            else { & $setCreatedDay }
+        if ($pt -eq "relativemonthly") {
+            Write-Warning "  [recurrence] 'relativeMonthly' (Nth weekday of month) mapped to MONTHLY - weekday constraint lost."
         }
+    }
+    elseif ($pt -eq "absoluteyearly" -or $pt -eq "relativeyearly") {
+        $repeatCycle = "YEARLY"
 
-        { $_ -eq "absolutemonthly" -or $_ -eq "relativemonthly" } {
-            $repeatCycle = "MONTHLY"
-
-            # Prefer dueDate's day; fall back to dayOfMonth field; then createdDate
-            if (-not [string]::IsNullOrWhiteSpace($dueDateStr)) {
-                $dto = Parse-Dto $dueDateStr
-                if ($dto) { $startDate = Get-DbDateStr $dto }
-            }
-            if (-not $startDate -and
-                $pattern.PSObject.Properties.Name -contains 'dayOfMonth' -and
-                $pattern.dayOfMonth -gt 0) {
-                $startDate = Get-DbDateStrFromDayOfMonth $createdDate ([int]$pattern.dayOfMonth)
-            }
-            if (-not $startDate) { $startDate = Get-DbDateStr $createdDate }
-
-            if ($patType.ToLower() -eq "relativemonthly") {
-                Write-Warning "  [recurrence] 'relativeMonthly' (Nth weekday of month) mapped to MONTHLY – weekday constraint lost."
-            }
+        if (-not [string]::IsNullOrWhiteSpace($dueDateStr)) {
+            $dto = Parse-Dto $dueDateStr
+            if ($dto) { $startDate = Get-DbDateStr $dto }
         }
+        if (-not $startDate) { $startDate = Get-DbDateStr $createdDate }
 
-        { $_ -eq "absoluteyearly" -or $_ -eq "relativeyearly" } {
-            $repeatCycle = "YEARLY"
-
-            if (-not [string]::IsNullOrWhiteSpace($dueDateStr)) {
-                $dto = Parse-Dto $dueDateStr
-                if ($dto) { $startDate = Get-DbDateStr $dto }
-            }
-            if (-not $startDate) { $startDate = Get-DbDateStr $createdDate }
-
-            if ($patType.ToLower() -eq "relativeyearly") {
-                Write-Warning "  [recurrence] 'relativeYearly' (Nth weekday of month/year) mapped to YEARLY – weekday constraint lost."
-            }
+        if ($pt -eq "relativeyearly") {
+            Write-Warning "  [recurrence] 'relativeYearly' (Nth weekday of month/year) mapped to YEARLY - weekday constraint lost."
         }
-
-        default {
-            Write-Warning "  [recurrence] Unknown pattern type '$patType' – skipping repeat config."
-            return $null
-        }
+    }
+    else {
+        Write-Warning "  [recurrence] Unknown pattern type '$patType' - skipping repeat config."
+        return $null
     }
 
     # Determine quickSetting
@@ -379,7 +371,7 @@ function Convert-RecurrencePattern {
 }
 
 # ---------------------------------------------------------------------------
-# Pass 2 – convert lists → projects and tasks → SP tasks
+# Pass 2 - convert lists → projects and tasks → SP tasks
 # ---------------------------------------------------------------------------
 
 foreach ($list in $lists) {
@@ -548,7 +540,7 @@ foreach ($list in $lists) {
         }
 
         # ---- recurrence -------------------------------------------------------
-        # Completed tasks are not migrated with a repeat config – they are
+        # Completed tasks are not migrated with a repeat config - they are
         # historical instances and the repeat should start fresh in SP.
         if (-not $isDone -and
             $msTask.PSObject.Properties.Name -contains 'recurrence' -and
@@ -791,7 +783,7 @@ $appData = [ordered]@{
     }
     pluginMetadata = @()
     pluginUserData = @()
-    # Minimal globalConfig – the app's data-repair will fill in any missing keys
+    # Minimal globalConfig - the app's data-repair will fill in any missing keys
     globalConfig   = [ordered]@{
         misc         = [ordered]@{
             isConfirmBeforeExit                 = $false
@@ -873,10 +865,12 @@ if ($outDir -and -not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 }
 
+# Use a BOM-less UTF-8 encoder: a leading BOM can break JSON parsers (incl. SP's import)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText(
     $resolvedOutputFile,
     $json,
-    [System.Text.Encoding]::UTF8
+    $utf8NoBom
 )
 
 $taskCount = @($taskEntities.Keys).Count
