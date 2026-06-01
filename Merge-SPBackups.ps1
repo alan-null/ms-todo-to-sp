@@ -1,4 +1,4 @@
-﻿# Merge-SPBackups.ps1
+# Merge-SPBackups.ps1
 # ---------------------------------------------------------------------------
 # Merges two Super Productivity backup files with deduplication and conflict
 # resolution.  The Primary file is the "base" - its data is preserved, and
@@ -12,12 +12,19 @@
 #   - RepeatCfgs  - by ID, then by title within the same (mapped) project
 #   - Reminders   - by mapped relatedId
 #
-# Conflict resolution for matched tasks:
-#   - Newer "modified" timestamp wins for status fields (isDone, doneOn, due)
-#   - Notes are merged (appended with separator if both differ)
-#   - timeSpentOnDay entries are combined (max per day)
-#   - Subtask lists and tag lists are unioned
-#   - The more-complete version of other fields is preferred
+# Conflict handling for tasks (NON-DESTRUCTIVE):
+#   - Nothing in the Primary file is ever overwritten, merged into, or deleted.
+#   - When a Secondary task conflicts with a Primary one (same ID, or same
+#     title within the same mapped project AND a matching instance anchor), the
+#     Secondary task is kept as its own separate entry and its title is prefixed
+#     with "[CONFLICT] " so it can be reconciled by hand later.
+#   - If the conflict is an ID collision, the Secondary copy is given a fresh
+#     unique ID so both tasks can coexist; parentId / subTaskIds references are
+#     rewritten to match.
+#   - Non-conflicting Secondary tasks are added normally (unprefixed).
+#   - Projects, tags and repeat configs are still de-duplicated by ID/title;
+#     this never removes a task, it only routes Secondary tasks into the
+#     matching Primary container.
 #
 # Usage:
 #   .\Merge-SPBackups.ps1 -PrimaryFile "a.json" -SecondaryFile "b.json" -OutputFile "merged.json"
@@ -84,7 +91,7 @@ function ConvertFrom-JsonPreserveArrays {
                 foreach ($k in $obj.Keys) { $ht[$k] = Convert-JsObject $obj[$k] }
                 return $ht
             }
-            if ($obj -is [System.Collections.ArrayList]) {
+            if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string])) {
                 $arr = @($obj | ForEach-Object { Convert-JsObject $_ })
                 Write-Output -NoEnumerate $arr
                 return
@@ -93,6 +100,37 @@ function ConvertFrom-JsonPreserveArrays {
         }
         return Convert-JsObject ($ser.DeserializeObject($rawJson))
     }
+}
+
+# Ensure a parsed backup is in the canonical "wrapped" shape:
+#   { timestamp; lastUpdate; crossModelVersion; data = { task; project; tag; ... } }
+#
+# Super Productivity backups come in two on-disk shapes:
+#   * Full backup  - wrapped: a top-level "data" object holds the model, with
+#                    timestamp / lastUpdate / crossModelVersion alongside it.
+#   * Data export  - flat:    the model (task / project / tag / ...) sits at the
+#                    very top level, with no "data" wrapper and no metadata.
+# Every merge operation below addresses "$x.data.*", so a flat file must be
+# wrapped first; otherwise "$x.data" is $null and all access cascades into
+# NullArray / InvokeMethodOnNull / PropertyNotFound errors.
+function ConvertTo-WrappedBackup {
+    param($parsed)
+    if ($null -eq $parsed) { return $parsed }
+
+    $isDict = $parsed -is [System.Collections.IDictionary]
+
+    # Already wrapped: has a "data" member that is itself an object.
+    if ($isDict -and $parsed.Contains("data") -and ($parsed.data -is [System.Collections.IDictionary])) {
+        return $parsed
+    }
+
+    # Flat model -> wrap it, carrying over any top-level metadata if present.
+    $wrapped = [ordered]@{}
+    $wrapped["timestamp"]         = if ($isDict -and $parsed.Contains("timestamp"))         { $parsed["timestamp"] }         else { 0 }
+    $wrapped["lastUpdate"]        = if ($isDict -and $parsed.Contains("lastUpdate"))        { $parsed["lastUpdate"] }        else { 0 }
+    $wrapped["crossModelVersion"] = if ($isDict -and $parsed.Contains("crossModelVersion")) { $parsed["crossModelVersion"] } else { 4.5 }
+    $wrapped["data"]              = $parsed
+    return $wrapped
 }
 
 # Normalise a title for comparison
@@ -109,6 +147,28 @@ function Safe-ArrayAdd {
     if ($val -in $arr) { Write-Output -NoEnumerate $arr; return }
     $result = @($arr) + @($val)
     Write-Output -NoEnumerate $result
+}
+
+# Prefix a secondary task title to flag an unresolved conflict (idempotent).
+function Add-ConflictPrefix {
+    param([string]$title)
+    if ($null -eq $title) { $title = "" }
+    if ($title.StartsWith("[CONFLICT]")) { return $title }
+    return "[CONFLICT] $title"
+}
+
+# Mint a task id that is not used by either backup or a previously minted id.
+# Used only when a secondary task id collides with a primary one, so both copies
+# can coexist (the primary task is never overwritten).
+$script:usedTaskIds = @{}
+$script:idAlphabet  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".ToCharArray()
+function New-UniqueTaskId {
+    do {
+        $chars = for ($i = 0; $i -lt 21; $i++) { $script:idAlphabet[(Get-Random -Maximum $script:idAlphabet.Length)] }
+        $id = -join $chars
+    } while ($script:usedTaskIds.Contains($id))
+    $script:usedTaskIds[$id] = $true
+    return $id
 }
 
 # Pick the best task match from a list of candidates by closest created timestamp
@@ -233,7 +293,7 @@ Write-Host ""
 # Load files
 # ---------------------------------------------------------------------------
 Write-Host "Loading primary  : $PrimaryFile"
-$pri = ConvertFrom-JsonPreserveArrays (Get-Content -Path $PrimaryFile -Encoding UTF8 -Raw)
+$pri = ConvertTo-WrappedBackup (ConvertFrom-JsonPreserveArrays (Get-Content -Path $PrimaryFile -Encoding UTF8 -Raw))
 $priProjCountOrig = @($pri.data.project.ids).Count
 $priTaskCountOrig = @($pri.data.task.ids).Count
 $priTagCountOrig = (@($pri.data.tag.ids) | Where-Object { $_ -ne "TODAY" }).Count
@@ -245,7 +305,7 @@ $priSubtaskCountOrig = @($pri.data.task.ids | Where-Object {
     }).Count
 
 Write-Host "Loading secondary : $SecondaryFile"
-$sec = ConvertFrom-JsonPreserveArrays (Get-Content -Path $SecondaryFile -Encoding UTF8 -Raw)
+$sec = ConvertTo-WrappedBackup (ConvertFrom-JsonPreserveArrays (Get-Content -Path $SecondaryFile -Encoding UTF8 -Raw))
 $secTaskCountOrig = @($sec.data.task.ids).Count
 $secProjCountOrig = @($sec.data.project.ids).Count
 $secTagCountOrig = (@($sec.data.tag.ids) | Where-Object { $_ -ne "TODAY" }).Count
@@ -272,8 +332,8 @@ $stats = [ordered]@{
     ProjectsAdded = 0; ProjectsMerged = 0
     TagsAdded = 0; TagsMerged = 0
     RepeatCfgsAdded = 0; RepeatCfgsMerged = 0
-    TasksKept = 0; TasksAdded = 0; TasksMerged = 0
-    SubtasksAdded = 0; SubtasksMerged = 0
+    TasksKept = 0; TasksAdded = 0; TasksMerged = 0; TasksConflicted = 0
+    SubtasksAdded = 0; SubtasksMerged = 0; SubtasksConflicted = 0
     RemindersAdded = 0
 }
 
@@ -529,92 +589,76 @@ function Remap-TaskIds {
     }
 }
 
+# ---- Pre-assign a final id to every secondary task ------------------------
+# Conflict policy: nothing in the primary is overwritten. Every secondary task
+# becomes its own entry. A secondary id is kept as-is unless it collides with an
+# existing primary task id, in which case a fresh unique id is minted so both
+# tasks can coexist. This map also rewrites parentId / subTaskIds references
+# between secondary tasks.
+foreach ($id in @($pri.data.task.ids)) { $script:usedTaskIds[$id] = $true }
+foreach ($id in @($sec.data.task.ids)) { $script:usedTaskIds[$id] = $true }
+foreach ($id in @($sec.data.task.ids)) {
+    if ($priTaskIdSetOriginal.Contains($id)) {
+        $taskMap[$id] = New-UniqueTaskId   # id collision -> new id for the secondary copy
+    }
+    else {
+        $taskMap[$id] = $id
+    }
+}
+
 # ---- Process parent tasks ----
 foreach ($item in $secParents) {
-    $secId = $item.id
+    $secId   = $item.id
     $secTask = $item.task
+    $finalId = $taskMap[$secId]
 
-    $mappedProjId = if ($projectMap.Contains($secTask.projectId)) {
-        $projectMap[$secTask.projectId]
-    }
-    else { $secTask.projectId }
+    $mappedProjId = if ($projectMap.Contains($secTask.projectId)) { $projectMap[$secTask.projectId] } else { $secTask.projectId }
 
-    # ---- 4a. Same ID already in primary ----
-    if ($priTaskIdSet.Contains($secId)) {
-        $taskMap[$secId] = $secId
-        $priTask = $pri.data.task.entities[$secId]
-        $merged = Merge-TaskFields $priTask $secTask
-        # Merge tagIds from secondary
-        if ($secTask.tagIds) {
-            foreach ($tid in @($secTask.tagIds)) {
-                $mapped = if ($tagMap.Contains($tid)) { $tagMap[$tid] } else { $tid }
-                $priTask.tagIds = Safe-ArrayAdd $priTask.tagIds $mapped
-                if ($pri.data.tag.entities.Contains($mapped)) {
-                    $pri.data.tag.entities[$mapped].taskIds = Safe-ArrayAdd $pri.data.tag.entities[$mapped].taskIds $secId
+    # ---- Detect conflict against the ORIGINAL primary tasks ----
+    #   conflict = same id, OR same title in the same mapped project with a
+    #   matching instance anchor (the cases that previously caused a merge).
+    $isConflict = $priTaskIdSetOriginal.Contains($secId)
+    if (-not $isConflict) {
+        $key = "$(Normalize-Title $secTask.title)|||$mappedProjId"
+        if ($priTaskIndex.Contains($key)) {
+            $mappedRepeatCfgId = $null
+            if ($secTask.Contains("repeatCfgId") -and $secTask.repeatCfgId) {
+                $mappedRepeatCfgId = if ($repeatCfgMap.Contains($secTask.repeatCfgId)) { $repeatCfgMap[$secTask.repeatCfgId] } else { $secTask.repeatCfgId }
+            }
+            foreach ($cId in $priTaskIndex[$key]) {
+                if (-not $priTaskIdSetOriginal.Contains($cId)) { continue }
+                if (Is-SameTaskInstance $pri.data.task.entities[$cId] $secTask $mappedRepeatCfgId) {
+                    $isConflict = $true; break
                 }
             }
         }
-        if ($merged) {
-            $stats.TasksMerged++
-        }
-        else {
-            $stats.TasksKept++
-        }
-        continue
     }
 
-    # ---- 4b. Same title in same (mapped) project ----
-    $key = "$(Normalize-Title $secTask.title)|||$mappedProjId"
-    if ($priTaskIndex.Contains($key)) {
-        $mappedRepeatCfgId = $null
-        if ($secTask.Contains("repeatCfgId") -and $secTask.repeatCfgId) {
-            $mappedRepeatCfgId = if ($repeatCfgMap.Contains($secTask.repeatCfgId)) { $repeatCfgMap[$secTask.repeatCfgId] } else { $secTask.repeatCfgId }
-        }
-
-        $candidates = @()
-        foreach ($cId in $priTaskIndex[$key]) {
-            if (-not $priTaskIdSetOriginal.Contains($cId)) { continue }
-            $candidate = $pri.data.task.entities[$cId]
-            if (Is-SameTaskInstance $candidate $secTask $mappedRepeatCfgId) {
-                $candidates += $candidate
-            }
-        }
-        $match = Find-BestTaskMatch $candidates $secTask
-        if ($match) {
-            $taskMap[$secId] = $match.id
-            $merged = Merge-TaskFields $match $secTask
-            # Merge tagIds
-            if ($secTask.tagIds) {
-                foreach ($tid in @($secTask.tagIds)) {
-                    $mapped = if ($tagMap.Contains($tid)) { $tagMap[$tid] } else { $tid }
-                    $match.tagIds = Safe-ArrayAdd $match.tagIds $mapped
-                    if ($pri.data.tag.entities.Contains($mapped)) {
-                        $pri.data.tag.entities[$mapped].taskIds = Safe-ArrayAdd $pri.data.tag.entities[$mapped].taskIds $match.id
-                    }
-                }
-            }
-            if ($merged) {
-                $stats.TasksMerged++
-            }
-            else {
-                $stats.TasksKept++
-            }
-            continue
-        }
+    if ($isConflict) {
+        $secTask.title = Add-ConflictPrefix $secTask.title
+        $stats.TasksConflicted++
     }
 
-    # ---- 4c. New task ----
-    $taskMap[$secId] = $secId
-    Remap-TaskIds $secTask $secId
+    # ---- Add the secondary task as its own entry (primary untouched) ----
+    $taskMap[$secId] = $finalId
+    $secTask.id      = $finalId
+    Remap-TaskIds $secTask $finalId
+    if ($secTask.Contains("subTaskIds") -and $secTask.subTaskIds) {
+        $remappedSubs = @()
+        foreach ($st in @($secTask.subTaskIds)) {
+            $remappedSubs += if ($taskMap.Contains($st)) { $taskMap[$st] } else { $st }
+        }
+        $secTask.subTaskIds = $remappedSubs
+    }
 
-    $pri.data.task.ids = @($pri.data.task.ids) + @($secId)
-    $pri.data.task.entities[$secId] = $secTask
-    $priTaskIdSet[$secId] = $true
+    $pri.data.task.ids = @($pri.data.task.ids) + @($finalId)
+    $pri.data.task.entities[$finalId] = $secTask
+    $priTaskIdSet[$finalId] = $true
 
     # Add to project's taskIds
     if ($pri.data.project.entities.Contains($secTask.projectId)) {
         $pri.data.project.entities[$secTask.projectId].taskIds = `
-            Safe-ArrayAdd $pri.data.project.entities[$secTask.projectId].taskIds $secId
+            Safe-ArrayAdd $pri.data.project.entities[$secTask.projectId].taskIds $finalId
     }
 
     # Update index
@@ -622,72 +666,75 @@ foreach ($item in $secParents) {
     if (-not $priTaskIndex.Contains($ikey)) {
         $priTaskIndex[$ikey] = [System.Collections.Generic.List[string]]::new()
     }
-    $priTaskIndex[$ikey].Add($secId)
+    $priTaskIndex[$ikey].Add($finalId)
 
     $stats.TasksAdded++
-    Write-Host "  [ADD]         '$($secTask.title)' (project=$($secTask.projectId))"
+    if ($isConflict) {
+        Write-Host "  [CONFLICT]    '$($secTask.title)' (project=$($secTask.projectId))"
+    }
+    else {
+        Write-Host "  [ADD]         '$($secTask.title)' (project=$($secTask.projectId))"
+    }
 }
 
 # ---- Process subtasks ----
 Write-Host ""
 foreach ($item in $secChildren) {
-    $secId = $item.id
+    $secId   = $item.id
     $secTask = $item.task
+    $finalId = $taskMap[$secId]
 
-    $mappedProjId = if ($projectMap.Contains($secTask.projectId)) { $projectMap[$secTask.projectId] } else { $secTask.projectId }
-    $mappedParentId = if ($taskMap.Contains($secTask.parentId)) { $taskMap[$secTask.parentId] }     else { $secTask.parentId }
+    $mappedProjId   = if ($projectMap.Contains($secTask.projectId)) { $projectMap[$secTask.projectId] } else { $secTask.projectId }
+    $mappedParentId = if ($taskMap.Contains($secTask.parentId))     { $taskMap[$secTask.parentId] }     else { $secTask.parentId }
 
-    # 4d. Same ID
-    if ($priTaskIdSet.Contains($secId)) {
-        $taskMap[$secId] = $secId
-        $priTask = $pri.data.task.entities[$secId]
-        Merge-TaskFields $priTask $secTask | Out-Null
-        $stats.SubtasksMerged++
-        continue
-    }
-
-    # 4e. Same title + same mapped parent
-    $key = "$(Normalize-Title $secTask.title)|||$mappedProjId"
-    if ($priTaskIndex.Contains($key)) {
-        $mappedRepeatCfgId = $null
-        if ($secTask.Contains("repeatCfgId") -and $secTask.repeatCfgId) {
-            $mappedRepeatCfgId = if ($repeatCfgMap.Contains($secTask.repeatCfgId)) { $repeatCfgMap[$secTask.repeatCfgId] } else { $secTask.repeatCfgId }
-        }
-
-        $candidates = @()
-        foreach ($cId in $priTaskIndex[$key]) {
-            if (-not $priTaskIdSetOriginal.Contains($cId)) { continue }
-            $c = $pri.data.task.entities[$cId]
-            if ($c.Contains("parentId") -and $c.parentId -eq $mappedParentId) {
-                if (Is-SameTaskInstance $c $secTask $mappedRepeatCfgId) {
-                    $candidates += $c
+    # ---- Detect conflict against the ORIGINAL primary tasks ----
+    $isConflict = $priTaskIdSetOriginal.Contains($secId)
+    if (-not $isConflict) {
+        $key = "$(Normalize-Title $secTask.title)|||$mappedProjId"
+        if ($priTaskIndex.Contains($key)) {
+            $mappedRepeatCfgId = $null
+            if ($secTask.Contains("repeatCfgId") -and $secTask.repeatCfgId) {
+                $mappedRepeatCfgId = if ($repeatCfgMap.Contains($secTask.repeatCfgId)) { $repeatCfgMap[$secTask.repeatCfgId] } else { $secTask.repeatCfgId }
+            }
+            foreach ($cId in $priTaskIndex[$key]) {
+                if (-not $priTaskIdSetOriginal.Contains($cId)) { continue }
+                $c = $pri.data.task.entities[$cId]
+                if ($c.Contains("parentId") -and $c.parentId -eq $mappedParentId) {
+                    if (Is-SameTaskInstance $c $secTask $mappedRepeatCfgId) {
+                        $isConflict = $true; break
+                    }
                 }
             }
         }
-        $match = Find-BestTaskMatch $candidates $secTask
-        if ($match) {
-            $taskMap[$secId] = $match.id
-            Merge-TaskFields $match $secTask | Out-Null
-            $stats.SubtasksMerged++
-            Write-Host "  [MERGE-SUB]   '$($secTask.title)' ($secId -> $($match.id))"
-            continue
-        }
     }
 
-    # 4f. New subtask
-    $taskMap[$secId] = $secId
+    if ($isConflict) {
+        $secTask.title = Add-ConflictPrefix $secTask.title
+        $stats.SubtasksConflicted++
+    }
+
+    # ---- Add the secondary subtask as its own entry (primary untouched) ----
+    $taskMap[$secId]   = $finalId
+    $secTask.id        = $finalId
     $secTask.projectId = $mappedProjId
-    $secTask.parentId = $mappedParentId
-    Remap-TaskIds $secTask $secId
+    $secTask.parentId  = $mappedParentId
+    Remap-TaskIds $secTask $finalId
+    if ($secTask.Contains("subTaskIds") -and $secTask.subTaskIds) {
+        $remappedSubs = @()
+        foreach ($st in @($secTask.subTaskIds)) {
+            $remappedSubs += if ($taskMap.Contains($st)) { $taskMap[$st] } else { $st }
+        }
+        $secTask.subTaskIds = $remappedSubs
+    }
 
-    $pri.data.task.ids = @($pri.data.task.ids) + @($secId)
-    $pri.data.task.entities[$secId] = $secTask
-    $priTaskIdSet[$secId] = $true
+    $pri.data.task.ids = @($pri.data.task.ids) + @($finalId)
+    $pri.data.task.entities[$finalId] = $secTask
+    $priTaskIdSet[$finalId] = $true
 
-    # Add to parent's subTaskIds
+    # Attach to the (mapped) parent's subTaskIds so the copy stays nested
     if ($pri.data.task.entities.Contains($mappedParentId)) {
         $pri.data.task.entities[$mappedParentId].subTaskIds = `
-            Safe-ArrayAdd $pri.data.task.entities[$mappedParentId].subTaskIds $secId
+            Safe-ArrayAdd $pri.data.task.entities[$mappedParentId].subTaskIds $finalId
     }
 
     # Update index
@@ -695,10 +742,15 @@ foreach ($item in $secChildren) {
     if (-not $priTaskIndex.Contains($ikey)) {
         $priTaskIndex[$ikey] = [System.Collections.Generic.List[string]]::new()
     }
-    $priTaskIndex[$ikey].Add($secId)
+    $priTaskIndex[$ikey].Add($finalId)
 
     $stats.SubtasksAdded++
-    Write-Host "  [ADD-SUB]     '$($secTask.title)' (parent=$mappedParentId)"
+    if ($isConflict) {
+        Write-Host "  [CONFLICT-SUB] '$($secTask.title)' (parent=$mappedParentId)"
+    }
+    else {
+        Write-Host "  [ADD-SUB]     '$($secTask.title)' (parent=$mappedParentId)"
+    }
 }
 
 # ===========================================================================
@@ -1021,7 +1073,252 @@ $pri.lastUpdate = $NowMs
 if (-not $pri.Contains("crossModelVersion")) { $pri["crossModelVersion"] = 4.5 }
 
 # Serialize
-$json = $pri | ConvertTo-Json -Depth 20
+# --------------------------------------------------------------------------
+# Safety net: walk the entire tree and normalise any collection-wrapper
+# objects that PowerShell may have created (e.g. ArrayList, PSObject wrapper)
+# back to plain [object[]] arrays so that ConvertTo-Json serialises them as
+# JSON arrays rather than {"value":[],"Count":0} objects.
+function Normalize-Collections {
+    param($obj)
+    if ($null -eq $obj) { return $null }
+
+    if ($obj -is [System.Collections.IDictionary]) {
+        $keys = @($obj.Keys)
+        foreach ($k in $keys) {
+            $obj[$k] = Normalize-Collections $obj[$k]
+        }
+        return $obj
+    }
+
+    if ($obj -is [string]) { return $obj }
+
+    if ($obj -is [System.Collections.IEnumerable]) {
+        $list = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $obj) {
+            $list.Add((Normalize-Collections $item))
+        }
+        # IMPORTANT: emit the array WITHOUT pipeline-unrolling.
+        # A bare `return <array>` is unrolled by PowerShell when the caller
+        # captures it: an empty array collapses to $null and a single-element
+        # array collapses to the bare element. That is exactly what corrupts
+        # the array-valued fields (tagIds / subTaskIds / attachments / ...),
+        # so the very function meant to preserve arrays was destroying them.
+        # -NoEnumerate forces the array onto the stream as one object.
+        Write-Output -NoEnumerate ([object[]]$list.ToArray())
+        return
+    }
+
+    return $obj
+}
+
+# ---------------------------------------------------------------------------
+# Schema-aware array coercion (authoritative safety net)
+# ---------------------------------------------------------------------------
+# Super Productivity's import validator requires certain fields to be JSON
+# arrays. PowerShell can unwrap a single-element array into a bare scalar, turn
+# an empty array into $null, or (under Windows PowerShell 5.1) serialise an
+# empty collection as {}. None of those can be recovered generically, because a
+# bare string or $null carries no hint that it was meant to be an array. The
+# fix has to be schema-aware: for every known array-valued field on every known
+# entity, force the value to a real [object[]] using DIRECT ASSIGNMENT (which,
+# unlike a function return, never triggers pipeline unrolling).
+#
+# Canonical array-valued fields per entity type, derived from the SP data model
+# (and verified against the real backup + export files).
+$script:EntityArrayFields = @{
+    task          = @("subTaskIds", "tagIds", "attachments")
+    project       = @("taskIds", "backlogTaskIds", "noteIds")
+    tag           = @("taskIds")
+    taskRepeatCfg = @("tagIds", "deletedInstanceDates")
+    issueProvider = @("defaultTagIds")
+    metric        = @("focusSessions", "reflections")
+    # Archived tasks share the task schema plus a legacy "subTasks" array.
+    archiveTask   = @("subTaskIds", "tagIds", "attachments", "subTasks")
+}
+
+# Coerce a single value to a genuine [object[]] without ever unrolling.
+# Returns via the caller's direct assignment, so this is a *filter-free* helper:
+# callers must use it only as  $x = ... then re-wrap, OR use Set-ArrayField.
+function Set-ArrayField {
+    param($entity, [string]$field)
+    if ($null -eq $entity -or -not ($entity -is [System.Collections.IDictionary])) { return }
+    $cur = if ($entity.Contains($field)) { $entity[$field] } else { $null }
+
+    if ($null -eq $cur) {
+        $entity[$field] = [object[]]@()
+    }
+    elseif ($cur -is [string]) {
+        # single id that was unwrapped from a one-element array
+        $entity[$field] = [object[]]@($cur)
+    }
+    elseif ($cur -is [System.Collections.IDictionary]) {
+        if ($cur.Count -eq 0) {
+            # empty array that PowerShell rendered as an empty object {}
+            $entity[$field] = [object[]]@()
+        }
+        else {
+            # a single real element (e.g. one attachment) unwrapped from its array
+            $entity[$field] = [object[]]@($cur)
+        }
+    }
+    elseif ($cur -is [System.Collections.IEnumerable]) {
+        # already a collection (incl. a proper array) -> normalise to [object[]]
+        $entity[$field] = [object[]]@($cur)
+    }
+    else {
+        # scalar number / bool that was a one-element array
+        $entity[$field] = [object[]]@($cur)
+    }
+}
+
+# Walk an entities dictionary and coerce every listed array field in place.
+function Coerce-EntityCollection {
+    param($collection, [string[]]$fields)
+    if ($null -eq $collection -or -not ($collection -is [System.Collections.IDictionary])) { return }
+    $entities = if ($collection.Contains("entities")) { $collection["entities"] } else { $null }
+    if ($null -eq $entities -or -not ($entities -is [System.Collections.IDictionary])) { return }
+    foreach ($eid in @($entities.Keys)) {
+        $e = $entities[$eid]
+        foreach ($f in $fields) { Set-ArrayField $e $f }
+    }
+}
+
+# Apply the schema-aware coercion across the whole backup.
+function Coerce-AllArrayFields {
+    param($backup)
+    if ($null -eq $backup -or -not $backup.Contains("data")) { return }
+    $data = $backup["data"]
+
+    Coerce-EntityCollection $data["task"]          $script:EntityArrayFields.task
+    Coerce-EntityCollection $data["project"]       $script:EntityArrayFields.project
+    Coerce-EntityCollection $data["tag"]           $script:EntityArrayFields.tag
+    Coerce-EntityCollection $data["taskRepeatCfg"] $script:EntityArrayFields.taskRepeatCfg
+    Coerce-EntityCollection $data["issueProvider"] $script:EntityArrayFields.issueProvider
+    Coerce-EntityCollection $data["metric"]        $script:EntityArrayFields.metric
+
+    # Archived task collections (archiveYoung / archiveOld).
+    foreach ($archName in @("archiveYoung", "archiveOld")) {
+        if ($data.Contains($archName) -and $data[$archName] -and $data[$archName].Contains("task")) {
+            Coerce-EntityCollection $data[$archName]["task"] $script:EntityArrayFields.archiveTask
+        }
+    }
+
+    # Top-level reminders must be an array as well.
+    if (-not $data.Contains("reminders") -or $null -eq $data["reminders"]) {
+        $data["reminders"] = [object[]]@()
+    }
+    elseif (-not ($data["reminders"] -is [System.Collections.IEnumerable]) -or ($data["reminders"] -is [System.Collections.IDictionary])) {
+        if (($data["reminders"] -is [System.Collections.IDictionary]) -and $data["reminders"].Count -eq 0) {
+            $data["reminders"] = [object[]]@()
+        }
+        else {
+            $data["reminders"] = [object[]]@($data["reminders"])
+        }
+    }
+    else {
+        $data["reminders"] = [object[]]@($data["reminders"])
+    }
+}
+
+$pri = Normalize-Collections $pri
+# Authoritative pass: guarantee every schema-required array field is a real
+# array regardless of how an upstream step may have unwrapped it.
+Coerce-AllArrayFields $pri
+
+# ---------------------------------------------------------------------------
+# Deterministic JSON serializer (version-independent)
+# ---------------------------------------------------------------------------
+# We do NOT use ConvertTo-Json. Under Windows PowerShell 5.1 its serializer
+# reflects certain collection types (e.g. the arrays produced by `@(..) + @(..)`
+# and the .ids lists) into wrapper objects like {"value":[...],"Count":N},
+# which Super Productivity rejects ("task.ids expected Array<string>",
+# "note.todayOrder.filter is not a function"). This hand-rolled writer depends
+# only on type checks and a StringBuilder, so it emits identical, correct JSON
+# on both PowerShell 5.1 and 7+: ordered dictionaries become JSON objects and
+# every non-string IEnumerable becomes a JSON array (empty -> [], single -> [x]).
+function ConvertTo-SpJsonString {
+    param([string]$s)
+    if ($null -eq $s) { return '""' }
+    $sb = [System.Text.StringBuilder]::new($s.Length + 2)
+    [void]$sb.Append('"')
+    foreach ($ch in $s.ToCharArray()) {
+        switch ($ch) {
+            '"'  { [void]$sb.Append('\"') }
+            '\'  { [void]$sb.Append('\\') }
+            "`b" { [void]$sb.Append('\b') }
+            "`f" { [void]$sb.Append('\f') }
+            "`n" { [void]$sb.Append('\n') }
+            "`r" { [void]$sb.Append('\r') }
+            "`t" { [void]$sb.Append('\t') }
+            default {
+                if ([int]$ch -lt 0x20) {
+                    [void]$sb.Append('\u')
+                    [void]$sb.Append(([int]$ch).ToString('x4'))
+                }
+                else {
+                    [void]$sb.Append($ch)
+                }
+            }
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Write-SpJsonValue {
+    param($val, [System.Text.StringBuilder]$sb)
+
+    if ($null -eq $val) { [void]$sb.Append('null'); return }
+
+    if ($val -is [string]) { [void]$sb.Append((ConvertTo-SpJsonString $val)); return }
+    if ($val -is [bool])   { [void]$sb.Append($(if ($val) { 'true' } else { 'false' })); return }
+
+    if ($val -is [int] -or $val -is [long] -or $val -is [int64] -or $val -is [int32] -or
+        $val -is [int16] -or $val -is [byte] -or $val -is [sbyte] -or $val -is [uint32] -or $val -is [uint64]) {
+        [void]$sb.Append(([System.IConvertible]$val).ToString([System.Globalization.CultureInfo]::InvariantCulture)); return
+    }
+    if ($val -is [double] -or $val -is [single] -or $val -is [decimal]) {
+        $d = [double]$val
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { [void]$sb.Append('null'); return }
+        [void]$sb.Append($d.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)); return
+    }
+
+    if ($val -is [System.Collections.IDictionary]) {
+        [void]$sb.Append('{')
+        $first = $true
+        foreach ($k in $val.Keys) {
+            if (-not $first) { [void]$sb.Append(',') }
+            $first = $false
+            [void]$sb.Append((ConvertTo-SpJsonString ([string]$k)))
+            [void]$sb.Append(':')
+            Write-SpJsonValue $val[$k] $sb
+        }
+        [void]$sb.Append('}')
+        return
+    }
+
+    # Any non-string enumerable is a JSON array. This is the key line: it makes
+    # empty collections serialise as [] and single-element ones as [x], with no
+    # {value,Count} wrapper, regardless of the concrete collection type.
+    if ($val -is [System.Collections.IEnumerable]) {
+        [void]$sb.Append('[')
+        $first = $true
+        foreach ($item in $val) {
+            if (-not $first) { [void]$sb.Append(',') }
+            $first = $false
+            Write-SpJsonValue $item $sb
+        }
+        [void]$sb.Append(']')
+        return
+    }
+
+    # Fallback: stringify any unknown scalar type.
+    [void]$sb.Append((ConvertTo-SpJsonString ([string]$val)))
+}
+
+$__sb = [System.Text.StringBuilder]::new(16 * 1024 * 1024)
+Write-SpJsonValue $pri $__sb
+$json = $__sb.ToString()
 
 $resolvedOutputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFile)
 $outDir = Split-Path $resolvedOutputFile -Parent
@@ -1032,7 +1329,7 @@ if ($outDir -and -not (Test-Path $outDir)) {
 [System.IO.File]::WriteAllText(
     $resolvedOutputFile,
     $json,
-    [System.Text.Encoding]::UTF8
+    (New-Object System.Text.UTF8Encoding($false))   # UTF-8 without BOM (SP import rejects a BOM)
 )
 
 # ---------------------------------------------------------------------------
@@ -1061,8 +1358,8 @@ Write-Host ""
 Write-Host "  Merge actions:"
 Write-Host "    Projects  : $($stats.ProjectsMerged) matched, $($stats.ProjectsAdded) added"
 Write-Host "    Tags      : $($stats.TagsMerged) matched, $($stats.TagsAdded) added"
-Write-Host "    Tasks     : $($stats.TasksMerged) merged, $($stats.TasksAdded) added, $($stats.TasksKept) unchanged"
-Write-Host "    Subtasks  : $($stats.SubtasksMerged) merged, $($stats.SubtasksAdded) added"
+Write-Host "    Tasks     : $($stats.TasksAdded) added ($($stats.TasksConflicted) flagged [CONFLICT])"
+Write-Host "    Subtasks  : $($stats.SubtasksAdded) added ($($stats.SubtasksConflicted) flagged [CONFLICT])"
 Write-Host "    RepeatCfgs: $($stats.RepeatCfgsMerged) matched, $($stats.RepeatCfgsAdded) added"
 Write-Host "    Reminders : $($stats.RemindersAdded) added"
 Write-Host ""
@@ -1073,4 +1370,3 @@ Write-Host "    Tags      : $totalTags (+ TODAY)"
 Write-Host "    RepeatCfgs: $totalRepeats"
 Write-Host "    Reminders : $totalReminders"
 Write-Host "    Output    : $resolvedOutputFile"
-
